@@ -28,18 +28,22 @@ cargo vendor
 %cargo_prep -v vendor
 
 %build
-%cargo_build
+%cargo_build -f systemd
 %{cargo_license_summary}
 %{cargo_license} > LICENSE.dependencies
 
 %install
 %cargo_install
+mkdir -p %{buildroot}/etc/systemd/user
+cp -a resources/xwayland-satellite.service %{buildroot}/etc/systemd/user/
+sed -i "s:/usr/local/bin:%{_bindir}:" %{buildroot}/etc/systemd/user/xwayland-satellite.service
 
 %files
 %license LICENSE
 %license LICENSE.dependencies
 %doc README.md
 %{_bindir}/xwayland-satellite
+/etc/systemd/user
 
 %changelog
 %autochangelog
