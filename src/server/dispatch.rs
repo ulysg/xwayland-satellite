@@ -241,6 +241,7 @@ impl<C: XConnection>
                         role: None,
                         xwl: None,
                         window: None,
+                        output_key: None,
                     }
                     .into()
                 });
@@ -1295,7 +1296,7 @@ impl<C: XConnection> GlobalDispatch<WlOutput, Global> for ServerState<C> {
         data: &Global,
         data_init: &mut wayland_server::DataInit<'_, Self>,
     ) {
-        state.objects.insert_with_key(|key| {
+        let key = state.objects.insert_with_key(|key| {
             let server = data_init.init(resource, key);
             let client = state
                 .clientside
@@ -1309,6 +1310,7 @@ impl<C: XConnection> GlobalDispatch<WlOutput, Global> for ServerState<C> {
                 );
             Output::new(client, server).into()
         });
+        state.output_keys.insert(key, ());
     }
 }
 global_dispatch_with_events!(WlDrmServer, WlDrmClient);

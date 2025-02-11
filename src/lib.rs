@@ -4,25 +4,30 @@ mod server;
 pub mod xstate;
 
 use crate::server::{PendingSurfaceState, ServerState};
-use crate::xstate::XState;
+use crate::xstate::{RealConnection, XState};
 use log::{error, info};
 use rustix::event::{poll, PollFd, PollFlags};
+use smithay_client_toolkit::data_device_manager::WritePipe;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use wayland_server::{Display, ListeningSocket};
 use xcb::x;
 
 pub trait XConnection: Sized + 'static {
     type ExtraData: FromServerState<Self>;
-    type MimeTypeData: MimeTypeData;
+    type X11Selection: X11Selection;
 
     fn root_window(&self) -> x::Window;
     fn set_window_dims(&mut self, window: x::Window, dims: PendingSurfaceState);
     fn set_fullscreen(&mut self, window: x::Window, fullscreen: bool, data: Self::ExtraData);
-    fn focus_window(&mut self, window: x::Window, data: Self::ExtraData);
+    fn focus_window(
+        &mut self,
+        window: x::Window,
+        output_name: Option<String>,
+        data: Self::ExtraData,
+    );
     fn close_window(&mut self, window: x::Window, data: Self::ExtraData);
     fn raise_to_top(&mut self, window: x::Window);
 }
@@ -31,12 +36,12 @@ pub trait FromServerState<C: XConnection> {
     fn create(state: &ServerState<C>) -> Self;
 }
 
-pub trait MimeTypeData {
-    fn name(&self) -> &str;
-    fn data(&self) -> &[u8];
+pub trait X11Selection {
+    fn mime_types(&self) -> Vec<&str>;
+    fn write_to(&self, mime: &str, pipe: WritePipe);
 }
 
-type RealServerState = ServerState<Arc<xcb::Connection>>;
+type RealServerState = ServerState<RealConnection>;
 
 pub trait RunData {
     fn display(&self) -> Option<&str>;
@@ -156,11 +161,18 @@ pub fn main(data: impl RunData) -> Option<()> {
             display.insert(0, ':');
             info!("Connected to Xwayland on {display}");
             data.xwayland_ready(display);
-            server_state.set_x_connection(xstate.connection.clone());
-            server_state.atoms = Some(xstate.atoms.clone());
+            xstate.server_state_setup(&mut server_state);
 
             #[cfg(feature = "systemd")]
-            let _ = sd_notify::notify(true, &[sd_notify::NotifyState::Ready]);
+            {
+                match sd_notify::notify(true, &[sd_notify::NotifyState::Ready]) {
+                    Ok(()) => info!("Successfully notified systemd of ready state."),
+                    Err(e) => log::warn!("Systemd notify failed: {e:?}"),
+                }
+            }
+
+            #[cfg(not(feature = "systemd"))]
+            info!("Systemd support disabled.");
         }
 
         if let Some(xstate) = &mut xstate {

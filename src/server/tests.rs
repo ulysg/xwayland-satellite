@@ -3,6 +3,7 @@ use crate::xstate::{SetState, WmName};
 use paste::paste;
 use rustix::event::{poll, PollFd, PollFlags};
 use std::collections::HashMap;
+use std::io::Write;
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
@@ -182,19 +183,30 @@ impl super::FromServerState<FakeXConnection> for () {
     fn create(_: &FakeServerState) -> Self {}
 }
 
-impl crate::MimeTypeData for testwl::PasteData {
-    fn name(&self) -> &str {
-        &self.mime_type
+impl crate::X11Selection for Vec<testwl::PasteData> {
+    fn mime_types(&self) -> Vec<&str> {
+        self.iter().map(|data| data.mime_type.as_str()).collect()
     }
 
-    fn data(&self) -> &[u8] {
-        &self.data
+    fn write_to(
+        &self,
+        mime: &str,
+        mut pipe: smithay_client_toolkit::data_device_manager::WritePipe,
+    ) {
+        println!("writing");
+        let data = self
+            .iter()
+            .find(|data| data.mime_type == mime)
+            .unwrap_or_else(|| panic!("Couldn't find mime type {mime}"));
+        pipe.write_all(&data.data)
+            .expect("Couldn't write paste data");
+        println!("goodbye pipe {mime}");
     }
 }
 
 impl super::XConnection for FakeXConnection {
     type ExtraData = ();
-    type MimeTypeData = testwl::PasteData;
+    type X11Selection = Vec<testwl::PasteData>;
     fn root_window(&self) -> Window {
         self.root
     }
@@ -221,7 +233,7 @@ impl super::XConnection for FakeXConnection {
     }
 
     #[track_caller]
-    fn focus_window(&mut self, window: Window, _: ()) {
+    fn focus_window(&mut self, window: Window, _output_name: Option<String>, _: ()) {
         assert!(
             self.windows.contains_key(&window),
             "Unknown window: {window:?}"
@@ -737,9 +749,9 @@ where
         backend: &Backend,
         msg: Message<ObjectId, std::os::fd::OwnedFd>,
     ) -> Option<Arc<dyn ObjectData>> {
-        fn obj_data<T: Proxy>() -> Arc<dyn ObjectData>
+        fn obj_data<T>() -> Arc<dyn ObjectData>
         where
-            T: Send + Sync + 'static,
+            T: Proxy + Send + Sync + 'static,
             T::Event: Send + Sync + std::fmt::Debug,
         {
             Arc::new(TestObjectData::<T>::default())
@@ -1131,7 +1143,6 @@ fn window_group_properties() {
         win,
         super::WmHints {
             window_group: Some(prop_win),
-            ..Default::default()
         },
     );
     f.satellite.map_window(win);
@@ -1162,7 +1173,7 @@ fn copy_from_x11() {
         },
     ]);
 
-    f.satellite.set_copy_paste_source(mimes.clone());
+    f.satellite.set_copy_paste_source(&mimes);
     f.run();
 
     let server_mimes = f.testwl.data_source_mimes();
@@ -1170,9 +1181,10 @@ fn copy_from_x11() {
         assert!(server_mimes.contains(&mime.mime_type));
     }
 
-    let data = f.testwl.paste_data();
-    f.run();
-    let data = data.resolve();
+    let data = f.testwl.paste_data(|_, _| {
+        f.satellite.run();
+        true
+    });
     assert_eq!(*mimes, data);
 }
 
@@ -1236,7 +1248,7 @@ fn clipboard_x11_then_wayland() {
         },
     ]);
 
-    f.satellite.set_copy_paste_source(x11data.clone());
+    f.satellite.set_copy_paste_source(&x11data);
     f.run();
 
     let waylanddata = vec![
@@ -1511,10 +1523,11 @@ fn ignore_toplevel_reconfigure() {
     );
 }
 
+type EventMatcher<'a, Event> = Box<dyn FnMut(&Event) -> bool + 'a>;
 #[track_caller]
-fn events_check<'a, Event: std::fmt::Debug, const N: usize>(
+fn events_check<Event: std::fmt::Debug, const N: usize>(
     mut it: impl Iterator<Item = Event>,
-    mut matchers: [Box<dyn FnMut(&Event) -> bool + 'a>; N],
+    mut matchers: [EventMatcher<'_, Event>; N],
 ) {
     for (idx, matcher) in matchers.iter_mut().enumerate() {
         let item = it.next();
@@ -1582,10 +1595,7 @@ fn tablet_smoke_test() {
     events_check(
         tab_events,
         [
-            Box::new(|e| match e {
-                zwp_tablet_v2::Event::Name { name } if name == "tabby" => true,
-                _ => false,
-            }),
+            Box::new(|e| matches!(e, zwp_tablet_v2::Event::Name { name } if name == "tabby")),
             Box::new(|e| matches!(e, zwp_tablet_v2::Event::Done)),
         ],
     );
@@ -1631,9 +1641,9 @@ fn tablet_smoke_test() {
     events_check(
         g_events,
         [
-            Box::new(|e| match e {
-                zwp_tablet_pad_group_v2::Event::Buttons { buttons } if buttons.is_empty() => true,
-                _ => false,
+            Box::new(|e| {
+                matches!(e,
+                zwp_tablet_pad_group_v2::Event::Buttons { buttons } if buttons.is_empty())
             }),
             Box::new(|e| matches!(e, zwp_tablet_pad_group_v2::Event::Ring { .. })),
             Box::new(|e| matches!(e, zwp_tablet_pad_group_v2::Event::Strip { .. })),
@@ -1641,6 +1651,60 @@ fn tablet_smoke_test() {
         ],
     )
 }
+
+#[test]
+fn fullscreen_heuristic() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let (_, output) = f.new_output(0, 0);
+
+    let window1 = unsafe { Window::new(1) };
+    let (_, id) = f.create_toplevel(&comp, window1);
+    f.testwl.move_surface_to_output(id, &output);
+    f.run();
+
+    let mut check_fullscreen = |id, override_redirect| {
+        let window = unsafe { Window::new(id) };
+        let (buffer, surface) = comp.create_surface();
+        let data = WindowData {
+            mapped: true,
+            dims: WindowDims {
+                x: 0,
+                y: 0,
+                // Outputs default to 1000x1000 in testwl
+                width: 1000,
+                height: 1000,
+            },
+            fullscreen: false,
+        };
+        f.new_window(window, override_redirect, data, None);
+        f.map_window(&comp, window, &surface.obj, &buffer);
+        f.run();
+        let id = f.check_new_surface();
+        let surface_data = f.testwl.get_surface_data(id).unwrap();
+        assert!(
+            surface_data.surface
+                == f.testwl
+                    .get_object::<s_proto::wl_surface::WlSurface>(id)
+                    .unwrap()
+        );
+
+        let Some(testwl::SurfaceRole::Toplevel(toplevel_data)) = &surface_data.role else {
+            panic!("Expected toplevel, got {:?}", surface_data.role);
+        };
+
+        assert!(
+            toplevel_data
+                .states
+                .contains(&xdg_toplevel::State::Fullscreen),
+            "states: {:?}",
+            toplevel_data.states
+        );
+    };
+
+    check_fullscreen(2, false);
+    check_fullscreen(3, true);
+}
+
 /// See Pointer::handle_event for an explanation.
 #[test]
 fn popup_pointer_motion_workaround() {}

@@ -91,8 +91,25 @@ impl HandleEvent for SurfaceData {
 }
 
 impl SurfaceData {
+    fn get_output_name(&self, state: &ServerState<impl XConnection>) -> Option<String> {
+        let output_name = self
+            .output_key
+            .and_then(|key| state.objects.get(key))
+            .map(|obj| <_ as AsRef<Output>>::as_ref(obj).name.clone());
+
+        if output_name.is_none() {
+            warn!(
+                "{} has no output name ({:?})",
+                self.server.id(),
+                self.output_key
+            );
+        }
+
+        output_name
+    }
+
     fn surface_event<C: XConnection>(
-        &self,
+        &mut self,
         event: client::wl_surface::Event,
         state: &mut ServerState<C>,
     ) {
@@ -106,24 +123,29 @@ impl SurfaceData {
                 };
                 let output: &mut Output = object.as_mut();
 
-                if let Some(win_data) = self
-                    .window
-                    .as_ref()
-                    .map(|win| state.windows.get_mut(&win).unwrap())
-                {
-                    let (x, y) = match output.position {
-                        OutputPosition::Xdg { x, y } => (x, y),
-                        OutputPosition::Wl { x, y } => (x, y),
-                    };
+                self.server.enter(&output.server);
+                self.output_key = Some(key);
+                debug!("{} entered {}", self.server.id(), output.server.id());
+                let windows = &mut state.windows;
+                if let Some(win_data) = self.window.as_ref().and_then(|win| windows.get_mut(win)) {
                     win_data.update_output_offset(
                         key,
-                        WindowOutputOffset { x, y },
+                        WindowOutputOffset {
+                            x: output.dimensions.x,
+                            y: output.dimensions.y,
+                        },
                         state.connection.as_mut().unwrap(),
                     );
-                    output.windows.insert(win_data.window);
+                    let window = win_data.window;
+                    output.windows.insert(window);
+                    if self.window.is_some() && state.last_focused_toplevel == self.window {
+                        let data = C::ExtraData::create(state);
+                        let output = self.get_output_name(state);
+                        let conn = state.connection.as_mut().unwrap();
+                        debug!("focused window changed outputs - resetting primary output");
+                        conn.focus_window(window, output, data);
+                    }
                 }
-                self.server.enter(&output.server);
-                debug!("{} entered {}", self.server.id(), output.server.id());
             }
             Event::Leave { output } => {
                 let key: ObjectKey = output.data().copied().unwrap();
@@ -132,6 +154,9 @@ impl SurfaceData {
                 };
                 let output: &mut Output = object.as_mut();
                 self.server.leave(&output.server);
+                if self.output_key == Some(key) {
+                    self.output_key = None;
+                }
             }
             Event::PreferredBufferScale { factor } => self.server.preferred_buffer_scale(factor),
             other => warn!("unhandled surface request: {other:?}"),
@@ -346,7 +371,6 @@ impl HandleEvent for Pointer {
         // destroy the menu if this occurs within a 500 ms interval (which it always does with
         // Niri). Other compositors do not run into this problem because they appear to not send
         // wl_pointer.enter until the user actually moves the mouse in the popup.
-        let mut process_event = Vec::new();
         match event {
             client::wl_pointer::Event::Enter {
                 serial,
@@ -423,14 +447,20 @@ impl HandleEvent for Pointer {
                     else {
                         unreachable!();
                     };
-                    process_event.push(client::wl_pointer::Event::Enter {
-                        serial: *serial,
-                        surface: surface.clone(),
-                        surface_x: *surface_x,
-                        surface_y: *surface_y,
-                    });
-                    process_event.push(event);
-                    trace!("resending enter ({serial}) before motion");
+                    let surface_key: ObjectKey = surface.data().copied().unwrap();
+                    if state.objects.get(surface_key).is_some() {
+                        trace!("resending enter ({serial}) before motion");
+                        let enter_event = client::wl_pointer::Event::Enter {
+                            serial: *serial,
+                            surface: surface.clone(),
+                            surface_x: *surface_x,
+                            surface_y: *surface_y,
+                        };
+                        self.handle_event(enter_event, state);
+                        self.handle_event(event, state);
+                    } else {
+                        warn!("could not move pointer to surface ({serial}): stale surface");
+                    }
                 } else {
                     self.server.motion(time, surface_x, surface_y);
                 }
@@ -496,10 +526,6 @@ impl HandleEvent for Pointer {
                 ]
             },
         }
-
-        for event in process_event {
-            self.handle_event(event, state);
-        }
     }
 }
 
@@ -518,10 +544,14 @@ impl HandleEvent for Keyboard {
                 if let Some(data) = state
                     .objects
                     .get(key)
-                    .map(|o| <_ as AsRef<SurfaceData>>::as_ref(o))
+                    .map(<_ as AsRef<SurfaceData>>::as_ref)
                 {
                     state.last_kb_serial = Some(serial);
-                    state.to_focus = Some(data.window.unwrap());
+                    let output_name = data.get_output_name(state);
+                    state.to_focus = Some(FocusData {
+                        window: data.window.unwrap(),
+                        output_name,
+                    });
                     self.server.enter(serial, &data.server, keys);
                 }
             }
@@ -533,9 +563,9 @@ impl HandleEvent for Keyboard {
                 if let Some(data) = state
                     .objects
                     .get(key)
-                    .map(|o| <_ as AsRef<SurfaceData>>::as_ref(o))
+                    .map(<_ as AsRef<SurfaceData>>::as_ref)
                 {
-                    if state.to_focus == Some(data.window.unwrap()) {
+                    if state.to_focus.as_ref().map(|d| d.window) == Some(data.window.unwrap()) {
                         state.to_focus.take();
                     } else {
                         state.unfocus = true;
@@ -625,9 +655,18 @@ pub struct XdgOutput {
 }
 
 #[derive(Copy, Clone)]
-pub enum OutputPosition {
-    Wl { x: i32, y: i32 },
-    Xdg { x: i32, y: i32 },
+enum OutputDimensionsSource {
+    Wl,
+    Xdg,
+}
+
+#[derive(Copy, Clone)]
+pub(super) struct OutputDimensions {
+    source: OutputDimensionsSource,
+    x: i32,
+    y: i32,
+    pub width: i32,
+    pub height: i32,
 }
 
 pub struct Output {
@@ -635,7 +674,8 @@ pub struct Output {
     pub server: WlOutput,
     pub xdg: Option<XdgOutput>,
     windows: HashSet<x::Window>,
-    position: OutputPosition,
+    pub(super) dimensions: OutputDimensions,
+    name: String,
 }
 
 impl Output {
@@ -645,7 +685,14 @@ impl Output {
             server,
             xdg: None,
             windows: HashSet::new(),
-            position: OutputPosition::Wl { x: 0, y: 0 },
+            dimensions: OutputDimensions {
+                source: OutputDimensionsSource::Wl,
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+            },
+            name: "<unknown>".to_string(),
         }
     }
 }
@@ -682,19 +729,23 @@ impl HandleEvent for Output {
 impl Output {
     fn update_offset<C: XConnection>(
         &mut self,
-        offset: OutputPosition,
+        source: OutputDimensionsSource,
+        x: i32,
+        y: i32,
         state: &mut ServerState<C>,
     ) {
-        if matches!(offset, OutputPosition::Wl { .. })
-            && matches!(self.position, OutputPosition::Xdg { .. })
+        if matches!(source, OutputDimensionsSource::Wl)
+            && matches!(self.dimensions.source, OutputDimensionsSource::Xdg)
         {
             return;
         }
 
-        self.position = offset;
-        let (x, y, id) = match offset {
-            OutputPosition::Xdg { x, y } => (x, y, self.xdg.as_ref().unwrap().server.id()),
-            OutputPosition::Wl { x, y } => (x, y, self.server.id()),
+        self.dimensions.source = source;
+        self.dimensions.x = x;
+        self.dimensions.y = y;
+        let id = match source {
+            OutputDimensionsSource::Xdg => self.xdg.as_ref().unwrap().server.id(),
+            OutputDimensionsSource::Wl => self.server.id(),
         };
         debug!("moving {id} to {x}x{y}");
         self.windows.retain(|window| {
@@ -708,7 +759,7 @@ impl Output {
                 state.connection.as_mut().unwrap(),
             );
 
-            return true;
+            true
         });
     }
     fn wl_event<C: XConnection>(
@@ -717,12 +768,25 @@ impl Output {
         state: &mut ServerState<C>,
     ) {
         if let client::wl_output::Event::Geometry { x, y, .. } = event {
-            self.update_offset(OutputPosition::Wl { x, y }, state);
+            self.update_offset(OutputDimensionsSource::Wl, x, y, state);
+        }
+
+        if let client::wl_output::Event::Mode { width, height, .. } = event {
+            if matches!(self.dimensions.source, OutputDimensionsSource::Wl) {
+                self.dimensions.width = width;
+                self.dimensions.height = height;
+                debug!("{} dimensions: {width}x{height} (wl)", self.server.id());
+            }
         }
 
         simple_event_shunt! {
             self.server, event: client::wl_output::Event => [
-                Name { name },
+                Name {
+                    |name| {
+                        self.name = name.clone();
+                        name
+                    }
+                },
                 Description { description },
                 Mode {
                     |flags| convert_wenum(flags),
@@ -752,9 +816,15 @@ impl Output {
         state: &mut ServerState<C>,
     ) {
         if let zxdg_output_v1::Event::LogicalPosition { x, y } = event {
-            self.update_offset(OutputPosition::Xdg { x, y }, state);
+            self.update_offset(OutputDimensionsSource::Xdg, x, y, state);
         }
         let xdg = &self.xdg.as_ref().unwrap().server;
+        if let zxdg_output_v1::Event::LogicalSize { width, height } = event {
+            self.dimensions.source = OutputDimensionsSource::Xdg;
+            self.dimensions.width = width;
+            self.dimensions.height = height;
+            debug!("{} dimensions: {width}x{height} (xdg)", self.server.id());
+        }
         simple_event_shunt! {
             xdg, event: zxdg_output_v1::Event => [
                 LogicalPosition { x, y },

@@ -8,7 +8,7 @@ use self::event::*;
 use super::FromServerState;
 use crate::clientside::*;
 use crate::xstate::{Atoms, WindowDims, WmHints, WmName, WmNormalHints};
-use crate::{MimeTypeData, XConnection};
+use crate::{X11Selection, XConnection};
 use log::{debug, warn};
 use rustix::event::{poll, PollFd, PollFlags};
 use slotmap::{new_key_type, HopSlotMap, SparseSecondaryMap};
@@ -18,10 +18,9 @@ use smithay_client_toolkit::data_device_manager::{
 };
 use std::collections::HashMap;
 use std::io::Read;
-use std::io::Write;
 use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::net::UnixStream;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use wayland_client::{globals::Global, protocol as client, Proxy};
 use wayland_protocols::{
     wp::{
@@ -179,6 +178,7 @@ pub struct SurfaceData {
     role: Option<SurfaceRole>,
     xwl: Option<XwaylandSurfaceV1>,
     window: Option<x::Window>,
+    output_key: Option<ObjectKey>,
 }
 
 impl SurfaceData {
@@ -468,24 +468,31 @@ fn handle_globals<'a, C: XConnection>(
 new_key_type! {
     pub struct ObjectKey;
 }
+
+struct FocusData {
+    window: x::Window,
+    output_name: Option<String>,
+}
+
 pub struct ServerState<C: XConnection> {
     pub atoms: Option<Atoms>,
     dh: DisplayHandle,
     clientside: ClientState,
     objects: ObjectMap,
     associated_windows: SparseSecondaryMap<ObjectKey, x::Window>,
+    output_keys: SparseSecondaryMap<ObjectKey, ()>,
     windows: HashMap<x::Window, WindowData>,
 
     qh: ClientQueueHandle,
     client: Option<Client>,
-    to_focus: Option<x::Window>,
+    to_focus: Option<FocusData>,
     unfocus: bool,
     last_focused_toplevel: Option<x::Window>,
     last_hovered: Option<x::Window>,
-    connection: Option<C>,
+    pub connection: Option<C>,
 
     xdg_wm_base: XdgWmBase,
-    clipboard_data: Option<ClipboardData<C::MimeTypeData>>,
+    clipboard_data: Option<ClipboardData<C::X11Selection>>,
     last_kb_serial: Option<u32>,
 }
 
@@ -511,7 +518,7 @@ impl<C: XConnection> ServerState<C> {
         let clipboard_data = manager.map(|manager| ClipboardData {
             manager,
             device: None,
-            source: None::<CopyPasteData<C::MimeTypeData>>,
+            source: None::<CopyPasteData<C::X11Selection>>,
         });
 
         dh.create_global::<Self, XwaylandShellV1, _>(1, ());
@@ -533,6 +540,7 @@ impl<C: XConnection> ServerState<C> {
             last_hovered: None,
             connection: None,
             objects: Default::default(),
+            output_keys: Default::default(),
             associated_windows: Default::default(),
             xdg_wm_base,
             clipboard_data,
@@ -664,7 +672,10 @@ impl<C: XConnection> ServerState<C> {
     }
 
     pub fn set_window_serial(&mut self, window: x::Window, serial: [u32; 2]) {
-        let win = self.windows.get_mut(&window).unwrap();
+        let Some(win) = self.windows.get_mut(&window) else {
+            warn!("Tried to set serial for unknown window {window:?}");
+            return;
+        };
         win.surface_serial = Some(serial);
     }
 
@@ -673,11 +684,7 @@ impl<C: XConnection> ServerState<C> {
             return true;
         };
 
-        if win.mapped && !win.attrs.override_redirect {
-            false
-        } else {
-            true
-        }
+        !win.mapped || win.attrs.override_redirect
     }
 
     pub fn reconfigure_window(&mut self, event: x::ConfigureNotifyEvent) {
@@ -766,7 +773,10 @@ impl<C: XConnection> ServerState<C> {
     }
 
     pub fn set_fullscreen(&mut self, window: x::Window, state: super::xstate::SetState) {
-        let win = self.windows.get(&window).unwrap();
+        let Some(win) = self.windows.get(&window) else {
+            warn!("Tried to set unknown window {window:?} fullscreen");
+            return;
+        };
         let Some(key) = win.surface_key else {
             warn!("Tried to set window without surface fullscreen: {window:?}");
             return;
@@ -781,10 +791,11 @@ impl<C: XConnection> ServerState<C> {
             return;
         };
 
+        use crate::xstate::SetState;
         match state {
-            crate::xstate::SetState::Add => toplevel.toplevel.set_fullscreen(None),
-            crate::xstate::SetState::Remove => toplevel.toplevel.unset_fullscreen(),
-            crate::xstate::SetState::Toggle => {
+            SetState::Add => toplevel.toplevel.set_fullscreen(None),
+            SetState::Remove => toplevel.toplevel.unset_fullscreen(),
+            SetState::Toggle => {
                 if toplevel.fullscreen {
                     toplevel.toplevel.unset_fullscreen()
                 } else {
@@ -798,14 +809,14 @@ impl<C: XConnection> ServerState<C> {
         let _ = self.windows.remove(&window);
     }
 
-    pub(crate) fn set_copy_paste_source(&mut self, mime_types: Rc<Vec<C::MimeTypeData>>) {
+    pub(crate) fn set_copy_paste_source(&mut self, selection: &Rc<C::X11Selection>) {
         if let Some(d) = &mut self.clipboard_data {
             let src = d
                 .manager
-                .create_copy_paste_source(&self.qh, mime_types.iter().map(|m| m.name()));
+                .create_copy_paste_source(&self.qh, selection.mime_types());
             let data = CopyPasteData::X11 {
                 inner: src,
-                data: mime_types,
+                data: Rc::downgrade(selection),
             };
             let CopyPasteData::X11 { inner, .. } = d.source.insert(data) else {
                 unreachable!();
@@ -827,7 +838,7 @@ impl<C: XConnection> ServerState<C> {
         self.clientside
             .queue
             .dispatch_pending(&mut self.clientside.globals)
-            .unwrap();
+            .expect("Failed dispatching client side Wayland events");
         self.handle_clientside_events();
     }
 
@@ -846,22 +857,29 @@ impl<C: XConnection> ServerState<C> {
         }
 
         {
-            if let Some(win) = self.to_focus.take() {
+            if let Some(FocusData {
+                window,
+                output_name,
+            }) = self.to_focus.take()
+            {
                 let data = C::ExtraData::create(self);
                 let conn = self.connection.as_mut().unwrap();
-                debug!("focusing window {win:?}");
-                conn.focus_window(win, data);
-                self.last_focused_toplevel = Some(win);
+                debug!("focusing window {window:?}");
+                conn.focus_window(window, output_name, data);
+                self.last_focused_toplevel = Some(window);
             } else if self.unfocus {
                 let data = C::ExtraData::create(self);
                 let conn = self.connection.as_mut().unwrap();
-                conn.focus_window(x::WINDOW_NONE, data);
+                conn.focus_window(x::WINDOW_NONE, None, data);
             }
             self.unfocus = false;
         }
 
         self.handle_clipboard_events();
-        self.clientside.queue.flush().unwrap();
+        self.clientside
+            .queue
+            .flush()
+            .expect("Failed flushing clientside events");
     }
 
     pub fn new_selection(&mut self) -> Option<ForeignSelection> {
@@ -880,13 +898,12 @@ impl<C: XConnection> ServerState<C> {
         let globals = &mut self.clientside.globals;
 
         if let Some(clipboard) = self.clipboard_data.as_mut() {
-            for (mime_type, mut fd) in std::mem::take(&mut globals.selection_requests) {
+            for (mime_type, fd) in std::mem::take(&mut globals.selection_requests) {
                 let CopyPasteData::X11 { data, .. } = clipboard.source.as_ref().unwrap() else {
-                    unreachable!()
+                    unreachable!("Got selection request without having set the selection?")
                 };
-                let pos = data.iter().position(|m| m.name() == mime_type).unwrap();
-                if let Err(e) = fd.write_all(data[pos].data()) {
-                    warn!("Failed to write selection data: {e:?}");
+                if let Some(data) = data.upgrade() {
+                    data.write_to(&mime_type, fd);
                 }
             }
 
@@ -907,15 +924,20 @@ impl<C: XConnection> ServerState<C> {
     }
 
     fn create_role_window(&mut self, window: x::Window, surface_key: ObjectKey) {
-        let surface: &mut SurfaceData = self.objects[surface_key].as_mut();
+        // Temporarily remove surface to placate borrow checker
+        let mut surface: SurfaceData = self.objects[surface_key]
+            .0
+            .take()
+            .unwrap()
+            .try_into()
+            .unwrap();
         surface.window = Some(window);
-        let client = &surface.client;
-        client.attach(None, 0, 0);
-        client.commit();
+        surface.client.attach(None, 0, 0);
+        surface.client.commit();
 
         let xdg_surface = self
             .xdg_wm_base
-            .get_xdg_surface(client, &self.qh, surface_key);
+            .get_xdg_surface(&surface.client, &self.qh, surface_key);
 
         let window_data = self.windows.get_mut(&window).unwrap();
         if window_data.attrs.override_redirect {
@@ -926,15 +948,27 @@ impl<C: XConnection> ServerState<C> {
                 window_data.attrs.popup_for = Some(win);
             }
         }
+
+        let mut fullscreen = false;
+        let (width, height) = (window_data.attrs.dims.width, window_data.attrs.dims.height);
+        for (key, _) in &self.output_keys {
+            let output: &Output = self.objects[key].as_ref();
+            if output.dimensions.width == width as i32 && output.dimensions.height == height as i32
+            {
+                fullscreen = true;
+                window_data.attrs.popup_for = None;
+            }
+        }
+
+        let surface_id = surface.client.id();
+        // Reinsert surface
+        self.objects[surface_key].0 = Some(surface.into());
         let window = self.windows.get(&window).unwrap();
 
         let role = if let Some(parent) = window.attrs.popup_for {
             debug!(
                 "creating popup ({:?}) {:?} {:?} {:?} {surface_key:?}",
-                window.window,
-                parent,
-                window.attrs.dims,
-                client.id()
+                window.window, parent, window.attrs.dims, surface_id
             );
 
             let parent_window = self.windows.get(&parent).unwrap();
@@ -973,7 +1007,7 @@ impl<C: XConnection> ServerState<C> {
             };
             SurfaceRole::Popup(Some(popup))
         } else {
-            let data = self.create_toplevel(window, surface_key, xdg_surface);
+            let data = self.create_toplevel(window, surface_key, xdg_surface, fullscreen);
             SurfaceRole::Toplevel(Some(data))
         };
 
@@ -998,6 +1032,7 @@ impl<C: XConnection> ServerState<C> {
         window: &WindowData,
         surface_key: ObjectKey,
         xdg: XdgSurface,
+        fullscreen: bool,
     ) -> ToplevelData {
         debug!("creating toplevel for {:?}", window.window);
 
@@ -1027,6 +1062,10 @@ impl<C: XConnection> ServerState<C> {
             .or(group.and_then(|g| g.attrs.title.as_ref()))
         {
             toplevel.set_title(title.name().to_string());
+        }
+
+        if fullscreen {
+            toplevel.set_fullscreen(None);
         }
 
         ToplevelData {
@@ -1079,10 +1118,10 @@ pub struct PendingSurfaceState {
     pub height: i32,
 }
 
-struct ClipboardData<M: MimeTypeData> {
+struct ClipboardData<X: X11Selection> {
     manager: DataDeviceManagerState,
     device: Option<DataDevice>,
-    source: Option<CopyPasteData<M>>,
+    source: Option<CopyPasteData<X>>,
 }
 
 pub struct ForeignSelection {
@@ -1110,10 +1149,10 @@ impl Drop for ForeignSelection {
     }
 }
 
-enum CopyPasteData<M: MimeTypeData> {
+enum CopyPasteData<X: X11Selection> {
     X11 {
         inner: CopyPasteSource,
-        data: Rc<Vec<M>>,
+        data: Weak<X>,
     },
     Foreign(ForeignSelection),
 }
