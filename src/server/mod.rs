@@ -5,30 +5,36 @@ mod event;
 mod tests;
 
 use self::event::*;
-use super::FromServerState;
 use crate::clientside::*;
-use crate::xstate::{Atoms, WindowDims, WmHints, WmName, WmNormalHints};
+use crate::xstate::{Decorations, WindowDims, WmHints, WmName, WmNormalHints};
 use crate::{X11Selection, XConnection};
 use log::{debug, warn};
 use rustix::event::{poll, PollFd, PollFlags};
 use slotmap::{new_key_type, HopSlotMap, SparseSecondaryMap};
+use smithay_client_toolkit::activation::ActivationState;
 use smithay_client_toolkit::data_device_manager::{
     data_device::DataDevice, data_offer::SelectionOffer, data_source::CopyPasteSource,
     DataDeviceManagerState,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::net::UnixStream;
 use std::rc::{Rc, Weak};
 use wayland_client::{globals::Global, protocol as client, Proxy};
+use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_v1::WpFractionalScaleV1;
+use wayland_protocols::xdg::decoration::zv1::client::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1;
+use wayland_protocols::xdg::decoration::zv1::client::zxdg_toplevel_decoration_v1::{
+    self, ZxdgToplevelDecorationV1,
+};
 use wayland_protocols::{
     wp::{
+        fractional_scale::v1::client::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
         linux_dmabuf::zv1::{client as c_dmabuf, server as s_dmabuf},
         pointer_constraints::zv1::server::zwp_pointer_constraints_v1::ZwpPointerConstraintsV1,
         relative_pointer::zv1::server::zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1,
         tablet::zv2::server::zwp_tablet_manager_v2::ZwpTabletManagerV2,
-        viewporter::server as s_vp,
+        viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter},
     },
     xdg::{
         shell::client::{
@@ -44,10 +50,11 @@ use wayland_protocols::{
         xwayland_shell_v1::XwaylandShellV1, xwayland_surface_v1::XwaylandSurfaceV1,
     },
 };
+use wayland_server::protocol::wl_seat::WlSeat;
 use wayland_server::{
     protocol::{
-        wl_callback::WlCallback, wl_compositor::WlCompositor, wl_output::WlOutput, wl_seat::WlSeat,
-        wl_shm::WlShm, wl_surface::WlSurface,
+        wl_callback::WlCallback, wl_compositor::WlCompositor, wl_output::WlOutput, wl_shm::WlShm,
+        wl_surface::WlSurface,
     },
     Client, DisplayHandle, Resource, WEnum,
 };
@@ -78,17 +85,18 @@ where
 }
 
 #[derive(Default, Debug)]
-pub struct WindowAttributes {
-    pub override_redirect: bool,
-    pub popup_for: Option<x::Window>,
-    pub dims: WindowDims,
-    pub size_hints: Option<WmNormalHints>,
-    pub title: Option<WmName>,
-    pub class: Option<String>,
-    pub group: Option<x::Window>,
+struct WindowAttributes {
+    is_popup: bool,
+    dims: WindowDims,
+    size_hints: Option<WmNormalHints>,
+    title: Option<WmName>,
+    class: Option<String>,
+    group: Option<x::Window>,
+    decorations: Option<Decorations>,
+    transient_for: Option<x::Window>,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq, Copy, Clone)]
 struct WindowOutputOffset {
     x: i32,
     y: i32,
@@ -103,6 +111,7 @@ struct WindowData {
     attrs: WindowAttributes,
     output_offset: WindowOutputOffset,
     output_key: Option<ObjectKey>,
+    activation_token: Option<String>,
 }
 
 impl WindowData {
@@ -110,7 +119,7 @@ impl WindowData {
         window: x::Window,
         override_redirect: bool,
         dims: WindowDims,
-        parent: Option<x::Window>,
+        activation_token: Option<String>,
     ) -> Self {
         Self {
             window,
@@ -118,13 +127,13 @@ impl WindowData {
             surface_serial: None,
             mapped: false,
             attrs: WindowAttributes {
-                override_redirect,
+                is_popup: override_redirect,
                 dims,
-                popup_for: parent,
                 ..Default::default()
             },
             output_offset: WindowOutputOffset::default(),
             output_key: None,
+            activation_token,
         }
     }
 
@@ -179,6 +188,9 @@ pub struct SurfaceData {
     xwl: Option<XwaylandSurfaceV1>,
     window: Option<x::Window>,
     output_key: Option<ObjectKey>,
+    scale_factor: f64,
+    viewport: WpViewport,
+    fractional: Option<WpFractionalScaleV1>,
 }
 
 impl SurfaceData {
@@ -207,7 +219,10 @@ impl SurfaceData {
     fn destroy_role(&mut self) {
         if let Some(role) = self.role.take() {
             match role {
-                SurfaceRole::Toplevel(Some(t)) => {
+                SurfaceRole::Toplevel(Some(mut t)) => {
+                    if let Some(decoration) = t.decoration.take() {
+                        decoration.destroy();
+                    }
                     t.toplevel.destroy();
                     t.xdg.surface.destroy();
                 }
@@ -240,6 +255,7 @@ struct ToplevelData {
     toplevel: XdgToplevel,
     xdg: XdgSurfaceData,
     fullscreen: bool,
+    decoration: Option<ZxdgToplevelDecorationV1>,
 }
 
 #[derive(Debug)]
@@ -309,7 +325,7 @@ macro_rules! handle_event_enum {
         $(#[$meta:meta])*
         $pub:vis enum $name:ident {
             $( $variant:ident($ty:ty) ),+
-        }
+        } => $name_event:ident
     ) => {
         enum_try_from! {
             $(#[$meta])*
@@ -318,19 +334,15 @@ macro_rules! handle_event_enum {
             }
         }
 
-        paste::paste! {
-            enum_try_from! {
-                #[derive(Debug)]
-                $pub enum [<$name Event>] {
-                    $( $variant(<$ty as HandleEvent>::Event) ),+
-                }
+        enum_try_from! {
+            #[derive(Debug)]
+            $pub enum $name_event {
+                $( $variant(<$ty as HandleEvent>::Event) ),+
             }
         }
 
         impl HandleEvent for $name {
-            paste::paste! {
-                type Event = [<$name Event>];
-            }
+            type Event = $name_event;
 
             fn handle_event<C: XConnection>(&mut self, event: Self::Event, state: &mut ServerState<C>) {
                 match self {
@@ -371,7 +383,7 @@ pub(crate) enum Object {
     TabletPadGroup(TabletPadGroup),
     TabletPadRing(TabletPadRing),
     TabletPadStrip(TabletPadStrip)
-}
+} => ObjectEvent
 
 }
 
@@ -458,7 +470,6 @@ fn handle_globals<'a, C: XConnection>(
             WlDrmServer,
             s_dmabuf::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
             ZxdgOutputManagerV1,
-            s_vp::wp_viewporter::WpViewporter,
             ZwpPointerConstraintsV1,
             ZwpTabletManagerV2
         ];
@@ -474,14 +485,26 @@ struct FocusData {
     output_name: Option<String>,
 }
 
+#[derive(Copy, Clone, Default)]
+struct GlobalOutputOffsetDimension {
+    owner: Option<ObjectKey>,
+    value: i32,
+}
+
+#[derive(Copy, Clone)]
+struct GlobalOutputOffset {
+    x: GlobalOutputOffsetDimension,
+    y: GlobalOutputOffsetDimension,
+}
+
 pub struct ServerState<C: XConnection> {
-    pub atoms: Option<Atoms>,
     dh: DisplayHandle,
     clientside: ClientState,
     objects: ObjectMap,
     associated_windows: SparseSecondaryMap<ObjectKey, x::Window>,
     output_keys: SparseSecondaryMap<ObjectKey, ()>,
     windows: HashMap<x::Window, WindowData>,
+    pids: HashSet<u32>,
 
     qh: ClientQueueHandle,
     client: Option<Client>,
@@ -492,8 +515,16 @@ pub struct ServerState<C: XConnection> {
     pub connection: Option<C>,
 
     xdg_wm_base: XdgWmBase,
+    viewporter: WpViewporter,
+    fractional_scale: Option<WpFractionalScaleManagerV1>,
     clipboard_data: Option<ClipboardData<C::X11Selection>>,
-    last_kb_serial: Option<u32>,
+    last_kb_serial: Option<(client::wl_seat::WlSeat, u32)>,
+    activation_state: Option<ActivationState>,
+    global_output_offset: GlobalOutputOffset,
+    global_offset_updated: bool,
+    output_scales_updated: bool,
+    new_scale: Option<i32>,
+    decoration_manager: Option<ZxdgDecorationManagerV1>,
 }
 
 impl<C: XConnection> ServerState<C> {
@@ -510,6 +541,15 @@ impl<C: XConnection> ServerState<C> {
             warn!("xdg_wm_base version 2 detected. Popup repositioning will not work, and some popups may not work correctly.");
         }
 
+        let viewporter = clientside
+            .global_list
+            .bind::<WpViewporter, _, _>(&qh, 1..=1, ())
+            .expect("Could not bind wp_viewporter");
+
+        let fractional_scale = clientside.global_list.bind::<WpFractionalScaleManagerV1, _, _>(&qh, 1..=1, ())
+            .inspect_err(|e| warn!("Couldn't bind fractional scale manager: {e}. Fractional scaling will not work."))
+            .ok();
+
         let manager = DataDeviceManagerState::bind(&clientside.global_list, &qh)
             .inspect_err(|e| {
                 warn!("Could not bind data device manager ({e:?}). Clipboard will not work.")
@@ -521,6 +561,20 @@ impl<C: XConnection> ServerState<C> {
             source: None::<CopyPasteData<C::X11Selection>>,
         });
 
+        let activation_state = ActivationState::bind(&clientside.global_list, &qh)
+            .inspect_err(|e| {
+                warn!("Could not bind xdg activation ({e:?}). Windows might not receive focus depending on compositor focus stealing policy.")
+            })
+            .ok();
+
+        let decoration_manager = clientside
+            .global_list
+            .bind::<ZxdgDecorationManagerV1, _, _>(&qh, 1..=1, ())
+            .inspect_err(|e| {
+                warn!("Could not bind xdg decoration ({e:?}). Windows might not have decorations.")
+            })
+            .ok();
+
         dh.create_global::<Self, XwaylandShellV1, _>(1, ());
         clientside
             .global_list
@@ -529,9 +583,9 @@ impl<C: XConnection> ServerState<C> {
 
         Self {
             windows: HashMap::new(),
+            pids: HashSet::new(),
             clientside,
             client: None,
-            atoms: None,
             qh,
             dh,
             to_focus: None,
@@ -543,8 +597,25 @@ impl<C: XConnection> ServerState<C> {
             output_keys: Default::default(),
             associated_windows: Default::default(),
             xdg_wm_base,
+            viewporter,
+            fractional_scale,
             clipboard_data,
             last_kb_serial: None,
+            activation_state,
+            global_output_offset: GlobalOutputOffset {
+                x: GlobalOutputOffsetDimension {
+                    owner: None,
+                    value: 0,
+                },
+                y: GlobalOutputOffsetDimension {
+                    owner: None,
+                    value: 0,
+                },
+            },
+            global_offset_updated: false,
+            output_scales_updated: false,
+            new_scale: None,
+            decoration_manager,
         }
     }
 
@@ -574,12 +645,30 @@ impl<C: XConnection> ServerState<C> {
         window: x::Window,
         override_redirect: bool,
         dims: WindowDims,
-        parent: Option<x::Window>,
+        pid: Option<u32>,
     ) {
+        let activation_token = pid
+            .filter(|pid| self.pids.insert(*pid))
+            .and_then(|pid| std::fs::read(format!("/proc/{pid}/environ")).ok())
+            .and_then(|environ| {
+                environ
+                    .split(|byte| *byte == 0)
+                    .find_map(|line| line.strip_prefix(b"XDG_ACTIVATION_TOKEN="))
+                    .and_then(|token| String::from_utf8(token.to_vec()).ok())
+            });
         self.windows.insert(
             window,
-            WindowData::new(window, override_redirect, dims, parent),
+            WindowData::new(window, override_redirect, dims, activation_token),
         );
+    }
+
+    pub fn set_popup(&mut self, window: x::Window, is_popup: bool) {
+        let Some(win) = self.windows.get_mut(&window) else {
+            debug!("not setting popup for unknown window {window:?}");
+            return;
+        };
+
+        win.attrs.is_popup = is_popup;
     }
 
     pub fn set_win_title(&mut self, window: x::Window, name: WmName) {
@@ -657,10 +746,16 @@ impl<C: XConnection> ServerState<C> {
                     let surface: &SurfaceData = object.as_ref();
                     if let Some(SurfaceRole::Toplevel(Some(data))) = &surface.role {
                         if let Some(min_size) = &hints.min_size {
-                            data.toplevel.set_min_size(min_size.width, min_size.height);
+                            data.toplevel.set_min_size(
+                                (min_size.width as f64 / surface.scale_factor) as i32,
+                                (min_size.height as f64 / surface.scale_factor) as i32,
+                            );
                         }
                         if let Some(max_size) = &hints.max_size {
-                            data.toplevel.set_max_size(max_size.width, max_size.height);
+                            data.toplevel.set_max_size(
+                                (max_size.width as f64 / surface.scale_factor) as i32,
+                                (max_size.height as f64 / surface.scale_factor) as i32,
+                            );
                         }
                     }
                 } else {
@@ -668,6 +763,35 @@ impl<C: XConnection> ServerState<C> {
                 }
             }
             win.attrs.size_hints = Some(hints);
+        }
+    }
+
+    pub fn set_win_decorations(&mut self, window: x::Window, decorations: Decorations) {
+        if self.decoration_manager.is_none() {
+            return;
+        };
+
+        let Some(win) = self.windows.get_mut(&window) else {
+            debug!("not setting decorations for unknown window {window:?}");
+            return;
+        };
+
+        if win.attrs.decorations != Some(decorations) {
+            debug!("setting {window:?} decorations {decorations:?}");
+            if let Some(key) = win.surface_key {
+                if let Some(object) = self.objects.get(key) {
+                    let surface: &SurfaceData = object.as_ref();
+                    if let Some(SurfaceRole::Toplevel(Some(data))) = &surface.role {
+                        data.decoration
+                            .as_ref()
+                            .unwrap()
+                            .set_mode(decorations.into());
+                    }
+                } else {
+                    warn!("could not set decorations on {window:?}: stale surface")
+                }
+            }
+            win.attrs.decorations = Some(decorations);
         }
     }
 
@@ -679,12 +803,12 @@ impl<C: XConnection> ServerState<C> {
         win.surface_serial = Some(serial);
     }
 
-    pub fn can_reconfigure_window(&mut self, window: x::Window) -> bool {
-        let Some(win) = self.windows.get_mut(&window) else {
+    pub fn can_change_position(&self, window: x::Window) -> bool {
+        let Some(win) = self.windows.get(&window) else {
             return true;
         };
 
-        !win.mapped || win.attrs.override_redirect
+        !win.mapped || win.attrs.is_popup
     }
 
     pub fn reconfigure_window(&mut self, event: x::ConfigureNotifyEvent) {
@@ -723,13 +847,19 @@ impl<C: XConnection> ServerState<C> {
         match &data.role {
             Some(SurfaceRole::Popup(Some(popup))) => {
                 popup.positioner.set_offset(
-                    event.x() as i32 - win.output_offset.x,
-                    event.y() as i32 - win.output_offset.y,
+                    ((event.x() as i32 - win.output_offset.x) as f64 / data.scale_factor) as i32,
+                    ((event.y() as i32 - win.output_offset.y) as f64 / data.scale_factor) as i32,
                 );
-                popup
-                    .positioner
-                    .set_size(event.width().into(), event.height().into());
+                popup.positioner.set_size(
+                    1.max((event.width() as f64 / data.scale_factor) as i32),
+                    1.max((event.height() as f64 / data.scale_factor) as i32),
+                );
                 popup.popup.reposition(&popup.positioner, 0);
+            }
+            Some(SurfaceRole::Toplevel(Some(_))) => {
+                win.attrs.dims.width = dims.width;
+                win.attrs.dims.height = dims.height;
+                data.update_viewport(win.attrs.dims, win.attrs.size_hints);
             }
             other => warn!("Non popup ({other:?}) being reconfigured, behavior may be off."),
         }
@@ -805,6 +935,49 @@ impl<C: XConnection> ServerState<C> {
         }
     }
 
+    pub fn set_transient_for(&mut self, window: x::Window, parent: x::Window) {
+        let Some(win) = self.windows.get_mut(&window) else {
+            return;
+        };
+
+        win.attrs.transient_for = Some(parent);
+    }
+
+    pub fn activate_window(&mut self, window: x::Window) {
+        let Some(activation_state) = self.activation_state.as_ref() else {
+            return;
+        };
+
+        let Some(last_focused_toplevel) = self.last_focused_toplevel else {
+            warn!("No last focused toplevel, cannot focus window {window:?}");
+            return;
+        };
+        let Some(win) = self.windows.get(&last_focused_toplevel) else {
+            warn!("Unknown last focused toplevel, cannot focus window {window:?}");
+            return;
+        };
+        let Some(key) = win.surface_key else {
+            warn!("Last focused toplevel has no surface, cannot focus window {window:?}");
+            return;
+        };
+        let Some(object) = self.objects.get_mut(key) else {
+            warn!("Last focused toplevel has stale reference, cannot focus window {window:?}");
+            return;
+        };
+        let surface: &mut SurfaceData = object.as_mut();
+        activation_state.request_token_with_data(
+            &self.qh,
+            xdg_activation::ActivationData::new(
+                window,
+                smithay_client_toolkit::activation::RequestData {
+                    app_id: win.attrs.class.clone(),
+                    seat_and_serial: self.last_kb_serial.clone(),
+                    surface: Some(surface.client.clone()),
+                },
+            ),
+        );
+    }
+
     pub fn destroy_window(&mut self, window: x::Window) {
         let _ = self.windows.remove(&window);
     }
@@ -821,7 +994,12 @@ impl<C: XConnection> ServerState<C> {
             let CopyPasteData::X11 { inner, .. } = d.source.insert(data) else {
                 unreachable!();
             };
-            if let Some(serial) = self.last_kb_serial.as_ref().copied() {
+            if let Some(serial) = self
+                .last_kb_serial
+                .as_ref()
+                .map(|(_seat, serial)| serial)
+                .copied()
+            {
                 inner.set_selection(d.device.as_ref().unwrap(), serial);
             }
         }
@@ -847,13 +1025,77 @@ impl<C: XConnection> ServerState<C> {
 
         for (key, event) in self.clientside.read_events() {
             let Some(object) = &mut self.objects.get_mut(key) else {
-                warn!("could not handle clientside event: stale surface");
+                warn!("could not handle clientside event: stale object");
                 continue;
             };
             let mut object = object.0.take().unwrap();
             object.handle_event(event, self);
+
             let ret = self.objects[key].0.replace(object); // safe indexed access?
             debug_assert!(ret.is_none());
+        }
+
+        if self.global_offset_updated {
+            if self.global_output_offset.x.owner.is_none()
+                || self.global_output_offset.y.owner.is_none()
+            {
+                self.calc_global_output_offset();
+            }
+
+            debug!(
+                "updated global output offset: {}x{}",
+                self.global_output_offset.x.value, self.global_output_offset.y.value
+            );
+            for (key, _) in self.output_keys.clone() {
+                let Some(object) = &mut self.objects.get_mut(key) else {
+                    continue;
+                };
+                let mut output: Output = object
+                    .0
+                    .take()
+                    .expect("Output object missing?")
+                    .try_into()
+                    .expect("Not an output?");
+                output.global_offset_updated(self);
+                self.objects[key].0.replace(output.into());
+            }
+            self.global_offset_updated = false;
+        }
+
+        if self.output_scales_updated {
+            let mut mixed_scale = false;
+            let mut scale;
+
+            'b: {
+                let mut keys_iter = self.output_keys.iter();
+                let (key, _) = keys_iter.next().unwrap();
+                let Some::<&Output>(output) = &mut self.objects.get(key).map(AsRef::as_ref) else {
+                    // This should never happen, but you never know...
+                    break 'b;
+                };
+
+                scale = output.scale();
+
+                for (key, _) in keys_iter {
+                    let Some::<&Output>(output) = self.objects.get(key).map(AsRef::as_ref) else {
+                        continue;
+                    };
+
+                    if output.scale() != scale {
+                        mixed_scale = true;
+                        scale = scale.min(output.scale());
+                    }
+                }
+
+                if mixed_scale {
+                    warn!("Mixed output scales detected, choosing to give apps the smallest detected scale ({scale}x)");
+                }
+
+                debug!("Using new scale {scale}");
+                self.new_scale = Some(scale);
+            }
+
+            self.output_scales_updated = false;
         }
 
         {
@@ -862,24 +1104,27 @@ impl<C: XConnection> ServerState<C> {
                 output_name,
             }) = self.to_focus.take()
             {
-                let data = C::ExtraData::create(self);
                 let conn = self.connection.as_mut().unwrap();
                 debug!("focusing window {window:?}");
-                conn.focus_window(window, output_name, data);
+                conn.focus_window(window, output_name);
                 self.last_focused_toplevel = Some(window);
             } else if self.unfocus {
-                let data = C::ExtraData::create(self);
                 let conn = self.connection.as_mut().unwrap();
-                conn.focus_window(x::WINDOW_NONE, None, data);
+                conn.focus_window(x::WINDOW_NONE, None);
             }
             self.unfocus = false;
         }
 
         self.handle_clipboard_events();
+        self.handle_activations();
         self.clientside
             .queue
             .flush()
             .expect("Failed flushing clientside events");
+    }
+
+    pub fn new_global_scale(&mut self) -> Option<i32> {
+        self.new_scale.take()
     }
 
     pub fn new_selection(&mut self) -> Option<ForeignSelection> {
@@ -923,14 +1168,51 @@ impl<C: XConnection> ServerState<C> {
         }
     }
 
+    fn handle_activations(&mut self) {
+        let Some(activation_state) = self.activation_state.as_ref() else {
+            return;
+        };
+        let globals = &mut self.clientside.globals;
+
+        globals.pending_activations.retain(|(window, token)| {
+            if let Some(surface) = self
+                .windows
+                .get(window)
+                .and_then(|window| window.surface_key)
+                .and_then(|key| self.objects.get(key))
+                .map(AsRef::<SurfaceData>::as_ref)
+            {
+                activation_state.activate::<Self>(&surface.client, token.clone());
+                return false;
+            }
+            true
+        });
+    }
+
+    fn calc_global_output_offset(&mut self) {
+        for (key, _) in &self.output_keys {
+            let Some(object) = &self.objects.get(key) else {
+                continue;
+            };
+
+            let output: &Output = object.as_ref();
+            if output.dimensions.x < self.global_output_offset.x.value {
+                self.global_output_offset.x = GlobalOutputOffsetDimension {
+                    owner: Some(key),
+                    value: output.dimensions.x,
+                }
+            }
+            if output.dimensions.y < self.global_output_offset.y.value {
+                self.global_output_offset.y = GlobalOutputOffsetDimension {
+                    owner: Some(key),
+                    value: output.dimensions.y,
+                }
+            }
+        }
+    }
+
     fn create_role_window(&mut self, window: x::Window, surface_key: ObjectKey) {
-        // Temporarily remove surface to placate borrow checker
-        let mut surface: SurfaceData = self.objects[surface_key]
-            .0
-            .take()
-            .unwrap()
-            .try_into()
-            .unwrap();
+        let surface: &mut SurfaceData = self.objects.get_mut(surface_key).unwrap().as_mut();
         surface.window = Some(window);
         surface.client.attach(None, 0, 0);
         surface.client.commit();
@@ -939,14 +1221,12 @@ impl<C: XConnection> ServerState<C> {
             .xdg_wm_base
             .get_xdg_surface(&surface.client, &self.qh, surface_key);
 
-        let window_data = self.windows.get_mut(&window).unwrap();
-        if window_data.attrs.override_redirect {
-            // Override redirect is hard to convert to Wayland!
-            if let Some(win) = self.last_hovered {
-                window_data.attrs.popup_for = Some(win);
-            } else if let Some(win) = self.last_focused_toplevel {
-                window_data.attrs.popup_for = Some(win);
-            }
+        // Temporarily remove to placate borrow checker
+        let window_data = self.windows.remove(&window).unwrap();
+
+        let mut popup_for = None;
+        if window_data.attrs.is_popup {
+            popup_for = self.last_hovered.or(self.last_focused_toplevel);
         }
 
         let mut fullscreen = false;
@@ -956,62 +1236,24 @@ impl<C: XConnection> ServerState<C> {
             if output.dimensions.width == width as i32 && output.dimensions.height == height as i32
             {
                 fullscreen = true;
-                window_data.attrs.popup_for = None;
+                popup_for = None;
             }
         }
 
-        let surface_id = surface.client.id();
-        // Reinsert surface
-        self.objects[surface_key].0 = Some(surface.into());
-        let window = self.windows.get(&window).unwrap();
-
-        let role = if let Some(parent) = window.attrs.popup_for {
-            debug!(
-                "creating popup ({:?}) {:?} {:?} {:?} {surface_key:?}",
-                window.window, parent, window.attrs.dims, surface_id
-            );
-
-            let parent_window = self.windows.get(&parent).unwrap();
-            let parent_surface: &SurfaceData =
-                self.objects[parent_window.surface_key.unwrap()].as_ref();
-            let parent_dims = parent_window.attrs.dims;
-
-            let x = window.attrs.dims.x - parent_dims.x;
-            let y = window.attrs.dims.y - parent_dims.y;
-
-            let positioner = self.xdg_wm_base.create_positioner(&self.qh, ());
-            positioner.set_size(window.attrs.dims.width as _, window.attrs.dims.height as _);
-            positioner.set_offset(x as i32, y as i32);
-            positioner.set_anchor(Anchor::TopLeft);
-            positioner.set_gravity(Gravity::BottomRight);
-            positioner.set_anchor_rect(
-                0,
-                0,
-                parent_window.attrs.dims.width as _,
-                parent_window.attrs.dims.height as _,
-            );
-            let popup = xdg_surface.get_popup(
-                Some(&parent_surface.xdg().unwrap().surface),
-                &positioner,
-                &self.qh,
-                surface_key,
-            );
-            let popup = PopupData {
-                popup,
-                positioner,
-                xdg: XdgSurfaceData {
-                    surface: xdg_surface,
-                    configured: false,
-                    pending: None,
-                },
-            };
-            SurfaceRole::Popup(Some(popup))
+        let initial_scale;
+        let role = if let Some(parent) = popup_for {
+            let data;
+            (initial_scale, data) =
+                self.create_popup(&window_data, surface_key, xdg_surface, parent);
+            SurfaceRole::Popup(Some(data))
         } else {
-            let data = self.create_toplevel(window, surface_key, xdg_surface, fullscreen);
+            initial_scale = 1.0;
+            let data = self.create_toplevel(&window_data, surface_key, xdg_surface, fullscreen);
             SurfaceRole::Toplevel(Some(data))
         };
 
         let surface: &mut SurfaceData = self.objects[surface_key].as_mut();
+        surface.scale_factor = initial_scale;
 
         let new_role_type = std::mem::discriminant(&role);
         let prev = surface.role.replace(role);
@@ -1020,15 +1262,17 @@ impl<C: XConnection> ServerState<C> {
             assert_eq!(
                 new_role_type, old_role_type,
                 "Surface for {:?} already had a role: {:?}",
-                window.window, role
+                window_data.window, role
             );
         }
 
         surface.client.commit();
+        // Reinsert
+        self.windows.insert(window, window_data);
     }
 
     fn create_toplevel(
-        &self,
+        &mut self,
         window: &WindowData,
         surface_key: ObjectKey,
         xdg: XdgSurface,
@@ -1068,6 +1312,56 @@ impl<C: XConnection> ServerState<C> {
             toplevel.set_fullscreen(None);
         }
 
+        let decoration = self.decoration_manager.as_ref().map(|decoration_manager| {
+            let decoration = decoration_manager.get_toplevel_decoration(&toplevel, &self.qh, ());
+            decoration.set_mode(
+                window
+                    .attrs
+                    .decorations
+                    .map_or(zxdg_toplevel_decoration_v1::Mode::ServerSide, From::from),
+            );
+            decoration
+        });
+
+        let surface: &SurfaceData = self.objects[surface_key].as_ref();
+        if let (Some(activation_state), Some(token)) = (
+            self.activation_state.as_ref(),
+            window.activation_token.clone(),
+        ) {
+            activation_state.activate::<Self>(&surface.client, token);
+        }
+
+        if let Some(parent) = window.attrs.transient_for {
+            // TODO: handle transient_for window not being mapped/not a toplevel
+            'b: {
+                let Some(parent_data) = self.windows.get_mut(&parent) else {
+                    warn!(
+                        "Window {:?} is marked transient for unknown window {:?}",
+                        window.window, parent
+                    );
+                    break 'b;
+                };
+
+                let Some(key) = parent_data.surface_key else {
+                    warn!("Parent window {parent:?} missing surface key.");
+                    break 'b;
+                };
+
+                let Some::<&SurfaceData>(surface) = self.objects.get(key).map(|o| o.as_ref())
+                else {
+                    warn!("Parent window {parent:?} surface is stale");
+                    break 'b;
+                };
+
+                let Some(SurfaceRole::Toplevel(Some(parent_toplevel))) = &surface.role else {
+                    warn!("Surface {:?} (for window {parent:?}) was not an active toplevel, not setting as parent", surface.client.id());
+                    break 'b;
+                };
+
+                toplevel.set_parent(Some(&parent_toplevel.toplevel));
+            }
+        }
+
         ToplevelData {
             xdg: XdgSurfaceData {
                 surface: xdg,
@@ -1076,7 +1370,66 @@ impl<C: XConnection> ServerState<C> {
             },
             toplevel,
             fullscreen: false,
+            decoration,
         }
+    }
+
+    fn create_popup(
+        &self,
+        window: &WindowData,
+        surface_key: ObjectKey,
+        xdg: XdgSurface,
+        parent: x::Window,
+    ) -> (f64, PopupData) {
+        let parent_window = self.windows.get(&parent).unwrap();
+        let parent_surface: &SurfaceData =
+            self.objects[parent_window.surface_key.unwrap()].as_ref();
+        let parent_dims = parent_window.attrs.dims;
+        let initial_scale = parent_surface.scale_factor;
+
+        debug!(
+            "creating popup ({:?}) {:?} {:?} {:?} {surface_key:?} (scale: {initial_scale})",
+            window.window,
+            parent,
+            window.attrs.dims,
+            xdg.id()
+        );
+
+        let positioner = self.xdg_wm_base.create_positioner(&self.qh, ());
+        positioner.set_size(
+            1.max((window.attrs.dims.width as f64 / initial_scale) as i32),
+            1.max((window.attrs.dims.height as f64 / initial_scale) as i32),
+        );
+        let x = ((window.attrs.dims.x - parent_dims.x) as f64 / initial_scale) as i32;
+        let y = ((window.attrs.dims.y - parent_dims.y) as f64 / initial_scale) as i32;
+        positioner.set_offset(x, y);
+        positioner.set_anchor(Anchor::TopLeft);
+        positioner.set_gravity(Gravity::BottomRight);
+        positioner.set_anchor_rect(
+            0,
+            0,
+            (parent_window.attrs.dims.width as f64 / initial_scale) as i32,
+            (parent_window.attrs.dims.height as f64 / initial_scale) as i32,
+        );
+        let popup = xdg.get_popup(
+            Some(&parent_surface.xdg().unwrap().surface),
+            &positioner,
+            &self.qh,
+            surface_key,
+        );
+
+        (
+            initial_scale,
+            PopupData {
+                popup,
+                positioner,
+                xdg: XdgSurfaceData {
+                    surface: xdg,
+                    configured: false,
+                    pending: None,
+                },
+            },
+        )
     }
 
     fn get_server_surface_from_client(
@@ -1099,8 +1452,7 @@ impl<C: XConnection> ServerState<C> {
 
     fn close_x_window(&mut self, window: x::Window) {
         debug!("sending close request to {window:?}");
-        let data = C::ExtraData::create(self);
-        self.connection.as_mut().unwrap().close_window(window, data);
+        self.connection.as_mut().unwrap().close_window(window);
         if self.last_focused_toplevel == Some(window) {
             self.last_focused_toplevel.take();
         }

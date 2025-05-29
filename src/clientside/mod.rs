@@ -1,3 +1,6 @@
+mod data_device;
+pub mod xdg_activation;
+
 use crate::server::{ObjectEvent, ObjectKey};
 use std::os::unix::net::UnixStream;
 use std::sync::{mpsc, Mutex, OnceLock};
@@ -16,8 +19,14 @@ use wayland_protocols::wp::relative_pointer::zv1::client::{
     zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1,
     zwp_relative_pointer_v1::ZwpRelativePointerV1,
 };
+use wayland_protocols::xdg::decoration::zv1::client::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1;
+use wayland_protocols::xdg::decoration::zv1::client::zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1;
 use wayland_protocols::{
     wp::{
+        fractional_scale::v1::client::{
+            wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
+            wp_fractional_scale_v1::WpFractionalScaleV1,
+        },
         linux_dmabuf::zv1::client::{
             self as dmabuf,
             zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1 as DmabufFeedback,
@@ -44,6 +53,7 @@ use wayland_protocols::{
         viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter},
     },
     xdg::{
+        activation::v1::client::xdg_activation_v1::XdgActivationV1,
         shell::client::{
             xdg_popup::XdgPopup, xdg_positioner::XdgPositioner, xdg_surface::XdgSurface,
             xdg_toplevel::XdgToplevel, xdg_wm_base::XdgWmBase,
@@ -67,6 +77,7 @@ pub struct Globals {
         smithay_client_toolkit::data_device_manager::WritePipe,
     )>,
     pub cancelled: bool,
+    pub pending_activations: Vec<(xcb::x::Window, String)>,
 }
 
 pub type ClientQueueHandle = QueueHandle<Globals>;
@@ -134,6 +145,10 @@ delegate_noop!(Globals: WpViewport);
 delegate_noop!(Globals: ZxdgOutputManagerV1);
 delegate_noop!(Globals: ZwpPointerConstraintsV1);
 delegate_noop!(Globals: ZwpTabletManagerV2);
+delegate_noop!(Globals: XdgActivationV1);
+delegate_noop!(Globals: ZxdgDecorationManagerV1);
+delegate_noop!(Globals: WpFractionalScaleManagerV1);
+delegate_noop!(Globals: ignore ZxdgToplevelDecorationV1);
 
 impl Dispatch<WlRegistry, GlobalListContents> for Globals {
     fn event(
@@ -222,6 +237,7 @@ push_events!(XdgOutput);
 push_events!(WlTouch);
 push_events!(ZwpConfinedPointerV1);
 push_events!(ZwpLockedPointerV1);
+push_events!(WpFractionalScaleV1);
 
 pub(crate) struct LateInitObjectKey<P: Proxy> {
     key: OnceLock<ObjectKey>,

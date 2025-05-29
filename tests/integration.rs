@@ -1,4 +1,7 @@
 use rustix::event::{poll, PollFd, PollFlags};
+use rustix::process::{Pid, Signal, WaitOptions};
+use std::collections::HashMap;
+use std::io::Write;
 use std::mem::ManuallyDrop;
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::net::UnixStream;
@@ -8,11 +11,14 @@ use std::sync::{
 };
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use wayland_protocols::xdg::shell::server::xdg_toplevel;
+use wayland_protocols::xdg::{
+    decoration::zv1::server::zxdg_toplevel_decoration_v1, shell::server::xdg_toplevel,
+};
+use wayland_server::protocol::wl_output;
 use wayland_server::Resource;
 use xcb::{x, Xid};
 use xwayland_satellite as xwls;
-use xwayland_satellite::xstate::WmSizeHintsFlags;
+use xwayland_satellite::xstate::{WmSizeHintsFlags, WmState};
 
 #[derive(Default)]
 struct TestDataInner {
@@ -20,15 +26,18 @@ struct TestDataInner {
     server_connected: AtomicBool,
     display: Mutex<Option<String>>,
     server: Mutex<Option<UnixStream>>,
+    pid: Mutex<Option<u32>>,
+    quit_rx: Mutex<Option<UnixStream>>,
 }
 
 #[derive(Default, Clone)]
 struct TestData(Arc<TestDataInner>);
 
 impl TestData {
-    fn new(server: UnixStream) -> Self {
+    fn new(server: UnixStream, quit_rx: UnixStream) -> Self {
         Self(Arc::new(TestDataInner {
             server: Mutex::new(server.into()),
+            quit_rx: Mutex::new(Some(quit_rx)),
             ..Default::default()
         }))
     }
@@ -50,8 +59,13 @@ impl xwls::RunData for TestData {
         self.server_connected.store(true, Ordering::Relaxed);
     }
 
-    fn xwayland_ready(&self, display: String) {
+    fn quit_rx(&self) -> Option<UnixStream> {
+        self.quit_rx.lock().unwrap().take()
+    }
+
+    fn xwayland_ready(&self, display: String, pid: u32) {
         *self.display.lock().unwrap() = Some(display);
+        *self.pid.lock().unwrap() = Some(pid);
     }
 
     fn display(&self) -> Option<&str> {
@@ -70,14 +84,20 @@ struct Fixture {
     thread: ManuallyDrop<JoinHandle<Option<()>>>,
     pollfd: PollFd<'static>,
     display: String,
+    pid: Pid,
+    quit_tx: UnixStream,
 }
 
 impl Drop for Fixture {
     fn drop(&mut self) {
         let thread = unsafe { ManuallyDrop::take(&mut self.thread) };
-        if thread.is_finished() {
-            thread.join().expect("Main thread panicked");
-        }
+        // Sending anything to the quit receiver to stop the main loop. Then we guarantee a main
+        // thread does not use file descriptors which outlive the Fixture's BorrowedFd
+        let return_ptr = Box::into_raw(Box::new(0_usize)) as usize;
+        self.quit_tx.write_all(&return_ptr.to_ne_bytes()).unwrap();
+        thread.join().expect("Main thread panicked");
+        rustix::process::kill_process(self.pid, Signal::Term).unwrap();
+        rustix::process::waitpid(Some(self.pid), WaitOptions::NOHANG).unwrap();
     }
 }
 
@@ -92,11 +112,13 @@ impl Fixture {
                 .init();
         });
 
+        let (quit_tx, quit_rx) = UnixStream::pair().unwrap();
+
         let (a, b) = UnixStream::pair().unwrap();
         let mut testwl = testwl::Server::new(false);
         pre_connect(&mut testwl);
         testwl.connect(a);
-        let our_data = TestData::new(b);
+        let our_data = TestData::new(b, quit_rx);
         let data = our_data.clone();
         let thread = std::thread::spawn(move || xwls::main(data));
 
@@ -141,11 +163,14 @@ impl Fixture {
         assert!(ready, "connecting to xwayland failed");
 
         let display = our_data.display.lock().unwrap().take().unwrap();
+        let pid = our_data.pid.lock().unwrap().take().unwrap();
         Self {
             testwl,
             thread: ManuallyDrop::new(thread),
             pollfd,
             display,
+            pid: Pid::from_raw(pid as _).expect("Xwayland PID was invalid?"),
+            quit_tx,
         }
     }
     fn new() -> Self {
@@ -155,6 +180,7 @@ impl Fixture {
     #[track_caller]
     fn wait_and_dispatch(&mut self) {
         let mut pollfd = [self.pollfd.clone()];
+        self.testwl.dispatch();
         assert!(
             poll(&mut pollfd, 50).unwrap() > 0,
             "Did not receive any events"
@@ -211,6 +237,29 @@ impl Fixture {
         surface
     }
 
+    #[track_caller]
+    fn map_as_popup(
+        &mut self,
+        connection: &mut Connection,
+        window: x::Window,
+    ) -> testwl::SurfaceId {
+        connection.map_window(window);
+        self.wait_and_dispatch();
+        let surface = self
+            .testwl
+            .last_created_surface_id()
+            .expect("No surface created");
+        let data = self.testwl.get_surface_data(surface).unwrap();
+        assert!(
+            matches!(data.role, Some(testwl::SurfaceRole::Popup(_))),
+            "surface role was wrong: {:?}",
+            data.role
+        );
+        self.testwl.configure_popup(surface);
+        self.wait_and_dispatch();
+        surface
+    }
+
     /// Triggers a Wayland side toplevel Close event and processes the corresponding
     /// X11 side WM_DELETE_WINDOW client message
     fn wm_delete_window(
@@ -226,13 +275,8 @@ impl Fixture {
             &[connection.atoms.wm_delete_window],
         );
         self.testwl.close_toplevel(surface);
-        connection.await_event();
-        let event = connection
-            .inner
-            .poll_for_event()
-            .unwrap()
-            .expect("No close event");
 
+        let event = connection.await_event();
         let xcb::Event::X(x::Event::ClientMessage(event)) = event else {
             panic!("Expected ClientMessage event, got {event:?}");
         };
@@ -260,13 +304,24 @@ xcb::atoms_struct! {
         wm_protocols => b"WM_PROTOCOLS",
         net_active_window => b"_NET_ACTIVE_WINDOW",
         wm_delete_window => b"WM_DELETE_WINDOW",
+        net_wm_state => b"_NET_WM_STATE",
+        skip_taskbar => b"_NET_WM_STATE_SKIP_TASKBAR",
+        transient_for => b"WM_TRANSIENT_FOR",
         clipboard => b"CLIPBOARD",
         targets => b"TARGETS",
         multiple => b"MULTIPLE",
+        wm_state => b"WM_STATE",
         wm_check => b"_NET_SUPPORTING_WM_CHECK",
+        win_type => b"_NET_WM_WINDOW_TYPE",
+        win_type_normal => b"_NET_WM_WINDOW_TYPE_NORMAL",
+        win_type_menu => b"_NET_WM_WINDOW_TYPE_MENU",
+        win_type_tooltip => b"_NET_WM_WINDOW_TYPE_TOOLTIP",
+        motif_wm_hints => b"_MOTIF_WM_HINTS" only_if_exists = false,
         mime1 => b"text/plain" only_if_exists = false,
         mime2 => b"blah/blah" only_if_exists = false,
         incr => b"INCR",
+        xsettings => b"_XSETTINGS_S0",
+        xsettings_setting => b"_XSETTINGS_SETTINGS",
     }
 }
 
@@ -390,12 +445,19 @@ impl Connection {
     }
 
     #[track_caller]
-    fn await_event(&mut self) {
-        self.pollfd.clear_revents();
+    #[must_use]
+    fn await_event(&mut self) -> xcb::Event {
+        if let Some(event) = self.poll_for_event().expect("Failed to poll for event") {
+            return event;
+        }
         assert!(
             poll(&mut [self.pollfd.clone()], 100).expect("poll failed") > 0,
             "Did not get any X11 events"
         );
+        self.pollfd.clear_revents();
+        self.poll_for_event()
+            .expect("Failed to poll for event after pollfd")
+            .unwrap()
     }
 
     #[track_caller]
@@ -426,18 +488,16 @@ impl Connection {
 
     #[track_caller]
     fn await_selection_request(&mut self) -> x::SelectionRequestEvent {
-        self.await_event();
-        match self.poll_for_event().unwrap() {
-            Some(xcb::Event::X(x::Event::SelectionRequest(r))) => r,
+        match self.await_event() {
+            xcb::Event::X(x::Event::SelectionRequest(r)) => r,
             other => panic!("Didn't get selection request event, instead got {other:?}"),
         }
     }
 
     #[track_caller]
     fn await_selection_notify(&mut self) -> x::SelectionNotifyEvent {
-        self.await_event();
-        match self.poll_for_event().unwrap() {
-            Some(xcb::Event::X(x::Event::SelectionNotify(r))) => r,
+        match self.await_event() {
+            xcb::Event::X(x::Event::SelectionNotify(r)) => r,
             other => panic!("Didn't get selection notify event, instead got {other:?}"),
         }
     }
@@ -469,9 +529,8 @@ impl Connection {
 
     #[track_caller]
     fn await_selection_owner_change(&mut self) -> xcb::xfixes::SelectionNotifyEvent {
-        self.await_event();
-        match self.poll_for_event().unwrap() {
-            Some(xcb::Event::XFixes(xcb::xfixes::Event::SelectionNotify(e))) => e,
+        match self.await_event() {
+            xcb::Event::XFixes(xcb::xfixes::Event::SelectionNotify(e)) => e,
             other => panic!("Expected XFixes SelectionNotify, got {other:?}"),
         }
     }
@@ -487,6 +546,17 @@ impl Connection {
             window,
             selection: self.atoms.clipboard,
             event_mask,
+        })
+        .unwrap();
+    }
+
+    #[track_caller]
+    fn send_client_message(&self, request: &x::ClientMessageEvent) {
+        self.send_and_check_request(&x::SendEvent {
+            propagate: false,
+            destination: x::SendEventDest::Window(self.root),
+            event_mask: x::EventMask::SUBSTRUCTURE_NOTIFY | x::EventMask::SUBSTRUCTURE_REDIRECT,
+            event: request,
         })
         .unwrap();
     }
@@ -669,6 +739,8 @@ fn input_focus() {
     let mut f = Fixture::new();
     let mut connection = Connection::new(&f.display);
 
+    let wm_state = connection.atoms.wm_state;
+
     let conn = std::cell::RefCell::new(&mut connection);
     let check_focus = |win: x::Window| {
         let connection = conn.borrow();
@@ -705,10 +777,29 @@ fn input_focus() {
     let (win2, surface2) = create_win();
     check_focus(win2);
 
+    // Simulate exclusive fullscreen clients that set window state to mimized on focus loss
+    conn.borrow()
+        .set_property(win1, wm_state, wm_state, &[WmState::Iconic as u32, 0]);
+
     f.testwl.focus_toplevel(surface1);
     // Seems the event doesn't get caught by wait_and_dispatch...
     std::thread::sleep(std::time::Duration::from_millis(10));
     check_focus(win1);
+    assert_eq!(
+        conn.borrow()
+            .get_reply(&x::GetProperty {
+                delete: false,
+                window: win1,
+                property: wm_state,
+                r#type: wm_state,
+                long_offset: 0,
+                long_length: 1,
+            })
+            .value::<u32>()
+            .first()
+            .and_then(|state| WmState::try_from(*state).ok()),
+        Some(WmState::Normal)
+    );
 
     f.testwl.unfocus_toplevel();
     std::thread::sleep(std::time::Duration::from_millis(10));
@@ -723,6 +814,28 @@ fn input_focus() {
     check_focus(x::WINDOW_NONE);
 
     f.wm_delete_window(&mut connection, win1, surface1);
+}
+
+#[test]
+fn activation_x11_to_x11() {
+    let mut f = Fixture::new();
+    let mut connection = Connection::new(&f.display);
+
+    let window1 = connection.new_window(connection.root, 0, 0, 20, 20, false);
+    let surface1 = f.map_as_toplevel(&mut connection, window1);
+    let window2 = connection.new_window(connection.root, 0, 0, 20, 20, false);
+    let surface2 = f.map_as_toplevel(&mut connection, window2);
+
+    f.testwl.focus_toplevel(surface2);
+    std::thread::sleep(Duration::from_millis(1));
+    connection.send_client_message(&x::ClientMessageEvent::new(
+        window1,
+        connection.atoms.net_active_window,
+        x::ClientMessageData::Data32([2, x::CURRENT_TIME, 0, 0, 0]),
+    ));
+    f.wait_and_dispatch();
+
+    assert_eq!(f.testwl.get_focused(), Some(surface1));
 }
 
 #[test]
@@ -770,7 +883,6 @@ fn quick_delete() {
     assert_eq!(f.testwl.get_surface_data(surf), None);
 }
 
-// aaaaaaaaaa
 #[test]
 fn copy_from_x11() {
     let mut f = Fixture::new();
@@ -1009,13 +1121,7 @@ fn bad_clipboard_data() {
     let mut f = Fixture::new();
     let mut connection = Connection::new(&f.display);
     let window = connection.new_window(connection.root, 0, 0, 20, 20, false);
-    connection.map_window(window);
-    f.wait_and_dispatch();
-    let surface = f
-        .testwl
-        .last_created_surface_id()
-        .expect("No surface created");
-    f.configure_and_verify_new_toplevel(&mut connection, window, surface);
+    f.map_as_toplevel(&mut connection, window);
     connection.set_selection_owner(window);
 
     let request = connection.await_selection_request();
@@ -1095,7 +1201,6 @@ fn close_window() {
         })
         .unwrap();
     f.testwl.close_toplevel(surface);
-    connection.await_event();
     f.wait_and_dispatch();
 
     // Connection should no longer work (KillClient)
@@ -1225,9 +1330,8 @@ fn incr_copy_from_x11() {
         }
         assert_ne!(destination_property, x::Atom::none());
 
-        connection.await_event();
-        let notify = match connection.poll_for_event().unwrap() {
-            Some(xcb::Event::X(x::Event::PropertyNotify(p))) => p,
+        let notify = match connection.await_event() {
+            xcb::Event::X(x::Event::PropertyNotify(p)) => p,
             other => panic!("Didn't get property notify event, instead got {other:?}"),
         };
 
@@ -1301,7 +1405,6 @@ fn wayland_then_x11_clipboard_owner() {
     f.testwl.dispatch();
     connection.verify_clipboard_owner(window);
 
-    connection.await_event();
     let request = connection.await_selection_request();
     assert_eq!(request.selection(), connection.atoms.clipboard);
     assert_eq!(request.target(), connection.atoms.targets);
@@ -1361,4 +1464,492 @@ fn fake_selection_targets() {
         std::str::from_utf8(paste_data).unwrap(),
         std::str::from_utf8(data).unwrap()
     );
+}
+
+#[test]
+fn popup_done() {
+    let mut f = Fixture::new();
+    let mut conn = Connection::new(&f.display);
+    let toplevel = conn.new_window(conn.root, 0, 0, 20, 20, false);
+    f.map_as_toplevel(&mut conn, toplevel);
+
+    let popup = conn.new_window(conn.root, 0, 0, 20, 20, true);
+    let surface = f.map_as_popup(&mut conn, popup);
+    let geometry = conn.get_reply(&x::GetGeometry {
+        drawable: x::Drawable::Window(popup),
+    });
+
+    assert_eq!(geometry.x(), 0);
+    assert_eq!(geometry.y(), 0);
+    assert_eq!(geometry.width(), 20);
+    assert_eq!(geometry.height(), 20);
+
+    f.testwl.popup_done(surface);
+    f.wait_and_dispatch();
+
+    let reply = conn
+        .wait_for_reply(conn.send_request(&x::GetWindowAttributes { window: popup }))
+        .expect("Couldn't get window attributes");
+
+    assert_eq!(reply.map_state(), x::MapState::Unmapped);
+}
+
+#[test]
+fn negative_output_coordinates() {
+    let mut f = Fixture::new();
+    let output = f.create_output(-500, -500);
+    let mut connection = Connection::new(&f.display);
+
+    let window = connection.new_window(connection.root, 0, 0, 200, 200, false);
+    let surface = f.map_as_toplevel(&mut connection, window);
+    f.testwl.move_surface_to_output(surface, &output);
+    f.testwl.move_pointer_to(surface, 30.0, 40.0);
+    f.wait_and_dispatch();
+
+    let tree = connection.get_reply(&x::QueryTree { window });
+    let geo = connection.get_reply(&x::GetGeometry {
+        drawable: x::Drawable::Window(window),
+    });
+    let reply = connection.get_reply(&x::TranslateCoordinates {
+        src_window: tree.parent(),
+        dst_window: connection.root,
+        src_x: geo.x(),
+        src_y: geo.y(),
+    });
+
+    assert!(reply.same_screen());
+    assert_eq!(reply.dst_x(), 0);
+    assert_eq!(reply.dst_y(), 0);
+
+    let ptr_reply = connection.get_reply(&x::QueryPointer {
+        window: connection.root,
+    });
+    assert!(ptr_reply.same_screen());
+    assert_eq!(ptr_reply.child(), window);
+    assert_eq!(ptr_reply.win_x(), 30);
+    assert_eq!(ptr_reply.win_y(), 40);
+}
+
+#[test]
+fn xdg_decorations() {
+    let mut f = Fixture::new();
+    let mut connection = Connection::new(&f.display);
+
+    let window = connection.new_window(connection.root, 0, 0, 20, 20, false);
+    let surface = f.map_as_toplevel(&mut connection, window);
+    let data = f.testwl.get_surface_data(surface).unwrap();
+    // The default decoration mode in x11 is SDD
+    assert_eq!(
+        data.toplevel()
+            .decoration
+            .as_ref()
+            .and_then(|(_, decoration)| *decoration),
+        Some(zxdg_toplevel_decoration_v1::Mode::ServerSide)
+    );
+
+    // CSD
+    connection.set_property(
+        window,
+        connection.atoms.motif_wm_hints,
+        connection.atoms.motif_wm_hints,
+        &[2u32, 0, 0, 0, 0],
+    );
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    f.testwl.dispatch();
+    let data = f.testwl.get_surface_data(surface).unwrap();
+    assert_eq!(
+        data.toplevel()
+            .decoration
+            .as_ref()
+            .and_then(|(_, decoration)| *decoration),
+        Some(zxdg_toplevel_decoration_v1::Mode::ClientSide)
+    );
+
+    // SSD
+    connection.set_property(
+        window,
+        connection.atoms.motif_wm_hints,
+        connection.atoms.motif_wm_hints,
+        &[2u32, 0, 1, 0, 0],
+    );
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    f.testwl.dispatch();
+    let data = f.testwl.get_surface_data(surface).unwrap();
+    assert_eq!(
+        data.toplevel()
+            .decoration
+            .as_ref()
+            .and_then(|(_, decoration)| *decoration),
+        Some(zxdg_toplevel_decoration_v1::Mode::ServerSide)
+    );
+}
+
+#[test]
+fn forced_1x_scale_consistent_x11_size() {
+    let mut f = Fixture::new();
+    f.testwl.enable_xdg_output_manager();
+    let output = f.create_output(0, 0);
+    output.scale(2);
+    output.done();
+
+    let mut conn = Connection::new(&f.display);
+    let window = conn.new_window(conn.root, 0, 0, 200, 200, false);
+    let surface = f.map_as_toplevel(&mut conn, window);
+    f.testwl.move_surface_to_output(surface, &output);
+    f.testwl.move_pointer_to(surface, 30.0, 40.0);
+    f.wait_and_dispatch();
+
+    let tree = conn.get_reply(&x::QueryTree { window });
+    let geo = conn.get_reply(&x::GetGeometry {
+        drawable: x::Drawable::Window(window),
+    });
+    let reply = conn.get_reply(&x::TranslateCoordinates {
+        src_window: tree.parent(),
+        dst_window: conn.root,
+        src_x: geo.x(),
+        src_y: geo.y(),
+    });
+
+    assert!(reply.same_screen());
+    assert_eq!(reply.dst_x(), 0);
+    assert_eq!(reply.dst_y(), 0);
+
+    let ptr_reply = conn.get_reply(&x::QueryPointer { window: conn.root });
+    assert!(ptr_reply.same_screen());
+    assert_eq!(ptr_reply.child(), window);
+    assert_eq!(ptr_reply.win_x(), 60);
+    assert_eq!(ptr_reply.win_y(), 80);
+
+    // Update scale
+    output.scale(3);
+    output.done();
+    f.testwl
+        .configure_toplevel(surface, 100, 100, vec![xdg_toplevel::State::Activated]);
+    f.testwl.focus_toplevel(surface);
+    f.testwl.move_pointer_to(surface, 30.0, 40.0);
+    f.wait_and_dispatch();
+
+    let ptr_reply = conn.get_reply(&x::QueryPointer { window: conn.root });
+    assert!(ptr_reply.same_screen());
+    assert_eq!(ptr_reply.child(), window);
+    assert_eq!(ptr_reply.win_x(), 90);
+    assert_eq!(ptr_reply.win_y(), 120);
+
+    // Popup
+    let popup = conn.new_window(conn.root, 60, 60, 30, 30, true);
+    f.map_as_popup(&mut conn, popup);
+    let tree = conn.get_reply(&x::QueryTree { window: popup });
+    let geo = conn.get_reply(&x::GetGeometry {
+        drawable: x::Drawable::Window(popup),
+    });
+    let reply = conn.get_reply(&x::TranslateCoordinates {
+        src_window: tree.parent(),
+        dst_window: conn.root,
+        src_x: geo.x(),
+        src_y: geo.y(),
+    });
+
+    assert_eq!(reply.dst_x(), 60);
+    assert_eq!(reply.dst_y(), 60);
+    assert_eq!(geo.width(), 30);
+    assert_eq!(geo.height(), 30);
+}
+
+#[test]
+fn popup_heuristics() {
+    let mut f = Fixture::new();
+    let mut connection = Connection::new(&f.display);
+
+    let win_toplevel = connection.new_window(connection.root, 0, 0, 20, 20, false);
+    f.map_as_toplevel(&mut connection, win_toplevel);
+
+    let ghidra_popup = connection.new_window(connection.root, 10, 10, 50, 50, false);
+    connection.set_property(
+        ghidra_popup,
+        x::ATOM_ATOM,
+        connection.atoms.win_type,
+        &[connection.atoms.win_type_normal],
+    );
+    connection.set_property(
+        ghidra_popup,
+        x::ATOM_ATOM,
+        connection.atoms.net_wm_state,
+        &[connection.atoms.skip_taskbar],
+    );
+    connection.set_property(
+        ghidra_popup,
+        connection.atoms.motif_wm_hints,
+        connection.atoms.motif_wm_hints,
+        &[0b11_u32, 0, 0, 0, 0],
+    );
+    f.map_as_popup(&mut connection, ghidra_popup);
+
+    let reaper_dialog = connection.new_window(connection.root, 10, 10, 50, 50, false);
+    connection.set_property(
+        ghidra_popup,
+        x::ATOM_ATOM,
+        connection.atoms.win_type,
+        &[connection.atoms.win_type_normal],
+    );
+    connection.set_property(
+        ghidra_popup,
+        x::ATOM_ATOM,
+        connection.atoms.net_wm_state,
+        &[connection.atoms.skip_taskbar],
+    );
+    connection.set_property(
+        ghidra_popup,
+        connection.atoms.motif_wm_hints,
+        connection.atoms.motif_wm_hints,
+        &[0x2_u32, 0, 0x2a, 0, 0],
+    );
+    f.map_as_toplevel(&mut connection, reaper_dialog);
+
+    let chromium_menu = connection.new_window(connection.root, 10, 10, 50, 50, true);
+    connection.set_property(
+        chromium_menu,
+        x::ATOM_ATOM,
+        connection.atoms.win_type,
+        &[connection.atoms.win_type_menu],
+    );
+    f.map_as_popup(&mut connection, chromium_menu);
+
+    let chromium_tooltip = connection.new_window(connection.root, 10, 10, 50, 50, true);
+    connection.set_property(
+        chromium_tooltip,
+        x::ATOM_ATOM,
+        connection.atoms.win_type,
+        &[connection.atoms.win_type_tooltip],
+    );
+    f.map_as_popup(&mut connection, chromium_tooltip);
+}
+
+#[test]
+fn xsettings_scale() {
+    let mut f = Fixture::new_preset(|testwl| {
+        testwl.new_output(0, 0); // WL-1
+    });
+    let connection = Connection::new(&f.display);
+    f.testwl.enable_xdg_output_manager();
+
+    struct Settings {
+        serial: u32,
+        data: HashMap<String, Setting>,
+    }
+    struct Setting {
+        value: i32,
+        last_change: u32,
+    }
+
+    let owner = connection
+        .get_reply(&x::GetSelectionOwner {
+            selection: connection.atoms.xsettings,
+        })
+        .owner();
+
+    let get_settings = || -> Settings {
+        let reply = connection.get_reply(&x::GetProperty {
+            delete: false,
+            window: owner,
+            property: connection.atoms.xsettings_setting,
+            r#type: connection.atoms.xsettings_setting,
+            long_offset: 0,
+            long_length: 60,
+        });
+        assert_eq!(reply.r#type(), connection.atoms.xsettings_setting);
+
+        let data = reply.value::<u8>();
+
+        let byte_order = data[0];
+        assert_eq!(byte_order, 0);
+        let serial = u32::from_le_bytes(data[4..8].try_into().unwrap());
+        let num_settings = u32::from_le_bytes(data[8..12].try_into().unwrap());
+
+        let mut current_idx = 12;
+        let mut settings = HashMap::new();
+        for _ in 0..num_settings {
+            assert_eq!(&data[current_idx..current_idx + 2], &[0, 0]);
+            let name_len =
+                u16::from_le_bytes(data[current_idx + 2..current_idx + 4].try_into().unwrap());
+
+            let padding_start = current_idx + 4 + name_len as usize;
+            let name = String::from_utf8(data[current_idx + 4..padding_start].to_vec()).unwrap();
+            let num_padding_bytes = (4 - (name_len as usize % 4)) % 4;
+            let data_start = padding_start + num_padding_bytes;
+            let last_change =
+                u32::from_le_bytes(data[data_start..data_start + 4].try_into().unwrap());
+            let value =
+                i32::from_le_bytes(data[data_start + 4..data_start + 8].try_into().unwrap());
+
+            settings.insert(name, Setting { value, last_change });
+            current_idx = data_start + 8;
+        }
+
+        Settings {
+            serial,
+            data: settings,
+        }
+    };
+
+    let settings = get_settings();
+    let settings_serial = settings.serial;
+    assert_eq!(settings.data["Xft/DPI"].value, 96 * 1024);
+    let dpi_serial = settings.data["Xft/DPI"].last_change;
+    assert_eq!(settings.data["Gdk/WindowScalingFactor"].value, 1);
+    let window_serial = settings.data["Gdk/WindowScalingFactor"].last_change;
+    assert_eq!(settings.data["Gdk/UnscaledDPI"].value, 96 * 1024);
+    let unscaled_serial = settings.data["Gdk/UnscaledDPI"].last_change;
+
+    let output = f.testwl.get_output("WL-1").unwrap();
+    output.scale(2);
+    output.done();
+    f.wait_and_dispatch();
+
+    let settings = get_settings();
+    assert!(settings.serial > settings_serial);
+    assert_eq!(settings.data["Xft/DPI"].value, 2 * 96 * 1024);
+    assert!(settings.data["Xft/DPI"].last_change > dpi_serial);
+    assert_eq!(settings.data["Gdk/WindowScalingFactor"].value, 2);
+    assert!(settings.data["Gdk/WindowScalingFactor"].last_change > window_serial);
+    assert_eq!(settings.data["Gdk/UnscaledDPI"].value, 96 * 1024);
+    assert_eq!(
+        settings.data["Gdk/UnscaledDPI"].last_change,
+        unscaled_serial
+    );
+
+    let output2 = f.create_output(0, 0);
+    let settings = get_settings();
+    assert_eq!(settings.data["Xft/DPI"].value, 96 * 1024);
+    assert_eq!(settings.data["Gdk/WindowScalingFactor"].value, 1);
+    assert_eq!(settings.data["Gdk/UnscaledDPI"].value, 96 * 1024);
+
+    output2.scale(2);
+    output2.done();
+    f.testwl.dispatch();
+    std::thread::sleep(Duration::from_millis(1));
+
+    let settings = get_settings();
+    assert_eq!(settings.data["Xft/DPI"].value, 2 * 96 * 1024);
+    assert_eq!(settings.data["Gdk/WindowScalingFactor"].value, 2);
+    assert_eq!(settings.data["Gdk/UnscaledDPI"].value, 96 * 1024);
+}
+
+#[test]
+fn xsettings_switch_owner() {
+    let f = Fixture::new();
+    let mut connection = Connection::new(&f.display);
+
+    let owner = connection
+        .get_reply(&x::GetSelectionOwner {
+            selection: connection.atoms.xsettings,
+        })
+        .owner();
+
+    let win = connection.generate_id();
+    connection
+        .send_and_check_request(&x::CreateWindow {
+            wid: win,
+            x: 0,
+            y: 0,
+            parent: connection.root,
+            depth: 0,
+            width: 1,
+            height: 1,
+            border_width: 0,
+            class: x::WindowClass::InputOnly,
+            visual: x::COPY_FROM_PARENT,
+            value_list: &[],
+        })
+        .unwrap();
+
+    connection
+        .send_and_check_request(&x::SetSelectionOwner {
+            owner: win,
+            selection: connection.atoms.xsettings,
+            time: x::CURRENT_TIME,
+        })
+        .unwrap();
+
+    assert_eq!(
+        connection
+            .get_reply(&x::GetSelectionOwner {
+                selection: connection.atoms.xsettings,
+            })
+            .owner(),
+        win
+    );
+
+    connection
+        .send_and_check_request(&xcb::xfixes::SelectSelectionInput {
+            window: connection.root,
+            selection: connection.atoms.xsettings,
+            event_mask: xcb::xfixes::SelectionEventMask::SET_SELECTION_OWNER
+                | xcb::xfixes::SelectionEventMask::SELECTION_WINDOW_DESTROY
+                | xcb::xfixes::SelectionEventMask::SELECTION_CLIENT_CLOSE,
+        })
+        .unwrap();
+
+    connection
+        .send_and_check_request(&x::DestroyWindow { window: win })
+        .unwrap();
+
+    match connection.await_event() {
+        xcb::Event::XFixes(xcb::xfixes::Event::SelectionNotify(x))
+            if x.subtype() == xcb::xfixes::SelectionEvent::SelectionWindowDestroy => {}
+        other => panic!("unexpected event {other:?}"),
+    }
+    match connection.await_event() {
+        xcb::Event::XFixes(xcb::xfixes::Event::SelectionNotify(x))
+            if x.subtype() == xcb::xfixes::SelectionEvent::SetSelectionOwner => {}
+        other => panic!("unexpected event {other:?}"),
+    }
+
+    assert_eq!(
+        connection
+            .get_reply(&x::GetSelectionOwner {
+                selection: connection.atoms.xsettings,
+            })
+            .owner(),
+        owner
+    );
+}
+
+#[test]
+fn rotated_output() {
+    let mut f = Fixture::new_preset(|testwl| {
+        testwl.enable_xdg_output_manager();
+        testwl.new_output(0, 0);
+    });
+    let mut connection = Connection::new(&f.display);
+
+    connection
+        .send_and_check_request(&x::ChangeWindowAttributes {
+            window: connection.root,
+            value_list: &[x::Cw::EventMask(x::EventMask::STRUCTURE_NOTIFY)],
+        })
+        .unwrap();
+
+    let output = f.testwl.get_output("WL-1").unwrap();
+    output.mode(wl_output::Mode::Current, 100, 1000, 60);
+    output.geometry(
+        0,
+        0,
+        50,
+        50,
+        wl_output::Subpixel::Unknown,
+        "satellite".to_string(),
+        "WL-1".to_string(),
+        wl_output::Transform::_90,
+    );
+    output.done();
+    f.testwl.dispatch();
+
+    match connection.await_event() {
+        xcb::Event::X(x::Event::ConfigureNotify(e)) => {
+            assert_eq!(e.window(), connection.root);
+            assert_eq!(e.width(), 1000);
+            assert_eq!(e.height(), 100);
+        }
+        other => panic!("unexpected event {other:?}"),
+    }
 }

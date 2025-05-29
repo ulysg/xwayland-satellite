@@ -1,6 +1,5 @@
 use super::{ServerState, WindowDims};
-use crate::xstate::{SetState, WmName};
-use paste::paste;
+use crate::xstate::{SetState, WinSize, WmName};
 use rustix::event::{poll, PollFd, PollFlags};
 use std::collections::HashMap;
 use std::io::Write;
@@ -14,7 +13,7 @@ use wayland_client::{
         wl_compositor::WlCompositor,
         wl_display::WlDisplay,
         wl_keyboard::WlKeyboard,
-        wl_output::WlOutput,
+        wl_output::{self, WlOutput},
         wl_pointer::WlPointer,
         wl_registry::WlRegistry,
         wl_seat::{self, WlSeat},
@@ -24,7 +23,6 @@ use wayland_client::{
     },
     Connection, Proxy, WEnum,
 };
-
 use wayland_protocols::{
     wp::{
         linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
@@ -45,13 +43,12 @@ use wayland_protocols::{
             zwp_tablet_tool_v2::{self, ZwpTabletToolV2},
             zwp_tablet_v2::{self, ZwpTabletV2},
         },
-        viewporter::client::wp_viewporter::WpViewporter,
     },
     xdg::{
         shell::server::{xdg_positioner, xdg_toplevel},
         xdg_output::zv1::client::{
             zxdg_output_manager_v1::{self, ZxdgOutputManagerV1},
-            zxdg_output_v1::ZxdgOutputV1,
+            zxdg_output_v1::{self, ZxdgOutputV1},
         },
     },
     xwayland::shell::v1::client::{
@@ -71,7 +68,7 @@ macro_rules! with_optional {
             $(
                 $field:ident: $type:ty
             ),+$(,)?
-        }
+        } => $name_optional:ident
     ) => {
         $( #[$attr] )?
         struct $name$(<$($lifetimes),+>)? {
@@ -80,23 +77,19 @@ macro_rules! with_optional {
             ),+
         }
 
-        paste! {
-            #[derive(Default)]
-            struct [< $name Optional >] {
-                $(
-                    $field: Option<$type>
-                ),+
-            }
+        #[derive(Default)]
+        struct $name_optional {
+            $(
+                $field: Option<$type>
+            ),+
         }
 
-        paste! {
-            impl From<[<$name Optional>]> for $name {
-                fn from(opt: [<$name Optional>]) -> Self {
-                    Self {
-                        $(
-                            $field: opt.$field.expect(concat!("uninitialized field ", stringify!($field)))
-                        ),+
-                    }
+        impl From<$name_optional> for $name {
+            fn from(opt: $name_optional) -> Self {
+                Self {
+                    $(
+                        $field: opt.$field.expect(concat!("uninitialized field ", stringify!($field)))
+                    ),+
                 }
             }
         }
@@ -111,7 +104,7 @@ struct Compositor {
     shell: TestObject<XwaylandShellV1>,
     seat: TestObject<WlSeat>,
     tablet_man: TestObject<ZwpTabletManagerV2>
-}
+} => CompositorOptional
 
 }
 
@@ -162,9 +155,16 @@ struct FakeXConnection {
 
 impl FakeXConnection {
     #[track_caller]
-    fn window(&mut self, window: Window) -> &mut WindowData {
+    fn window_mut(&mut self, window: Window) -> &mut WindowData {
         self.windows
             .get_mut(&window)
+            .unwrap_or_else(|| panic!("Unknown window: {window:?}"))
+    }
+
+    #[track_caller]
+    fn window(&self, window: Window) -> &WindowData {
+        self.windows
+            .get(&window)
             .unwrap_or_else(|| panic!("Unknown window: {window:?}"))
     }
 }
@@ -177,10 +177,6 @@ impl Default for FakeXConnection {
             windows: HashMap::new(),
         }
     }
-}
-
-impl super::FromServerState<FakeXConnection> for () {
-    fn create(_: &FakeServerState) -> Self {}
 }
 
 impl crate::X11Selection for Vec<testwl::PasteData> {
@@ -205,26 +201,25 @@ impl crate::X11Selection for Vec<testwl::PasteData> {
 }
 
 impl super::XConnection for FakeXConnection {
-    type ExtraData = ();
     type X11Selection = Vec<testwl::PasteData>;
     fn root_window(&self) -> Window {
         self.root
     }
 
     #[track_caller]
-    fn close_window(&mut self, window: Window, _: ()) {
+    fn close_window(&mut self, window: Window) {
         log::debug!("closing window {window:?}");
-        self.window(window).mapped = false;
+        self.window_mut(window).mapped = false;
     }
 
     #[track_caller]
-    fn set_fullscreen(&mut self, window: xcb::x::Window, fullscreen: bool, _: ()) {
-        self.window(window).fullscreen = fullscreen;
+    fn set_fullscreen(&mut self, window: xcb::x::Window, fullscreen: bool) {
+        self.window_mut(window).fullscreen = fullscreen;
     }
 
     #[track_caller]
     fn set_window_dims(&mut self, window: Window, state: super::PendingSurfaceState) {
-        self.window(window).dims = WindowDims {
+        self.window_mut(window).dims = WindowDims {
             x: state.x as _,
             y: state.y as _,
             width: state.width as _,
@@ -233,7 +228,7 @@ impl super::XConnection for FakeXConnection {
     }
 
     #[track_caller]
-    fn focus_window(&mut self, window: Window, _output_name: Option<String>, _: ()) {
+    fn focus_window(&mut self, window: Window, _output_name: Option<String>) {
         assert!(
             self.windows.contains_key(&window),
             "Unknown window: {window:?}"
@@ -246,6 +241,10 @@ impl super::XConnection for FakeXConnection {
             self.windows.contains_key(&window),
             "Unknown window: {window:?}"
         );
+    }
+
+    fn unmap_window(&mut self, _: x::Window) {
+        todo!()
     }
 }
 
@@ -264,8 +263,65 @@ struct TestFixture {
 
 static INIT: std::sync::Once = std::sync::Once::new();
 
+struct PopupBuilder {
+    window: Window,
+    parent_window: Window,
+    parent_surface: testwl::SurfaceId,
+    dims: WindowDims,
+    scale: f64,
+    check_size_and_pos: bool,
+}
+
+impl PopupBuilder {
+    fn new(window: Window, parent_window: Window, parent_surface: testwl::SurfaceId) -> Self {
+        Self {
+            window,
+            parent_window,
+            parent_surface,
+            dims: WindowDims {
+                x: 0,
+                y: 0,
+                width: 50,
+                height: 50,
+            },
+            scale: 1.0,
+            check_size_and_pos: true,
+        }
+    }
+
+    fn x(mut self, x: i16) -> Self {
+        self.dims.x = x;
+        self
+    }
+
+    fn y(mut self, y: i16) -> Self {
+        self.dims.y = y;
+        self
+    }
+
+    fn width(mut self, width: u16) -> Self {
+        self.dims.width = width;
+        self
+    }
+
+    fn height(mut self, height: u16) -> Self {
+        self.dims.height = height;
+        self
+    }
+
+    fn check_size_and_pos(mut self, check: bool) -> Self {
+        self.check_size_and_pos = check;
+        self
+    }
+
+    fn scale(mut self, scale: impl Into<f64>) -> Self {
+        self.scale = scale.into();
+        self
+    }
+}
+
 impl TestFixture {
-    fn new() -> Self {
+    fn new_pre_connect(pre_connect: impl FnOnce(&mut testwl::Server)) -> Self {
         INIT.call_once(|| {
             env_logger::builder()
                 .is_test(true)
@@ -275,6 +331,7 @@ impl TestFixture {
 
         let (client_s, server_s) = UnixStream::pair().unwrap();
         let mut testwl = testwl::Server::new(true);
+        pre_connect(&mut testwl);
         let display = Display::<FakeServerState>::new().unwrap();
         testwl.connect(server_s);
         // Handle initial globals roundtrip setup requirement
@@ -310,6 +367,10 @@ impl TestFixture {
         };
         f.run();
         f
+    }
+
+    fn new() -> Self {
+        Self::new_pre_connect(|_| {})
     }
 
     fn new_with_compositor() -> (Self, Compositor) {
@@ -488,13 +549,18 @@ impl TestFixture {
         man
     }
 
-    fn create_xdg_output(&mut self, man: &TestObject<ZxdgOutputManagerV1>, output: WlOutput) {
-        TestObject::<ZxdgOutputV1>::from_request(
+    fn create_xdg_output(
+        &mut self,
+        man: &TestObject<ZxdgOutputManagerV1>,
+        output: WlOutput,
+    ) -> TestObject<ZxdgOutputV1> {
+        let xdg = TestObject::<ZxdgOutputV1>::from_request(
             &man.obj,
             zxdg_output_manager_v1::Request::GetXdgOutput { output },
         );
         self.run();
         self.run();
+        xdg
     }
 
     fn register_window(&mut self, window: Window, data: WindowData) {
@@ -506,17 +572,11 @@ impl TestFixture {
             .insert(window, data);
     }
 
-    fn new_window(
-        &mut self,
-        window: Window,
-        override_redirect: bool,
-        data: WindowData,
-        parent: Option<Window>,
-    ) {
+    fn new_window(&mut self, window: Window, override_redirect: bool, data: WindowData) {
         let dims = data.dims;
         self.register_window(window, data);
         self.satellite
-            .new_window(window, override_redirect, dims, parent);
+            .new_window(window, override_redirect, dims, None);
     }
 
     fn map_window(
@@ -548,7 +608,7 @@ impl TestFixture {
 
         let serial = self.surface_serial;
         let serial_lo = (serial & 0xFF) as u32;
-        let serial_hi = (serial >> 8 & 0xFF) as u32;
+        let serial_hi = ((serial >> 8) & 0xFF) as u32;
         self.surface_serial += 1;
 
         xwl.send_request(Req::<XwaylandSurfaceV1>::SetSerial {
@@ -588,7 +648,7 @@ impl TestFixture {
             fullscreen: false,
         };
 
-        self.new_window(window, false, data, None);
+        self.new_window(window, false, data);
         self.map_window(comp, window, &surface.obj, &buffer);
         self.run();
         let id = self.check_new_surface();
@@ -637,28 +697,28 @@ impl TestFixture {
         (surface, id)
     }
 
+    #[track_caller]
     fn create_popup(
         &mut self,
         comp: &Compositor,
-        window: Window,
-        parent_window: Window,
-        parent_surface: testwl::SurfaceId,
-        x: i16,
-        y: i16,
+        builder: PopupBuilder,
     ) -> (TestObject<WlSurface>, testwl::SurfaceId) {
         let (buffer, surface) = comp.create_surface();
+        let PopupBuilder {
+            window,
+            parent_window,
+            parent_surface,
+            dims,
+            scale,
+            check_size_and_pos,
+        } = builder;
+
         let data = WindowData {
             mapped: true,
-            dims: WindowDims {
-                x,
-                y,
-                width: 50,
-                height: 50,
-            },
+            dims,
             fullscreen: false,
         };
-        let dims = data.dims;
-        self.new_window(window, true, data, None);
+        self.new_window(window, true, data);
         self.map_window(comp, window, &surface.obj, &buffer);
         self.run();
 
@@ -681,35 +741,43 @@ impl TestFixture {
                 surface_data.role
             );
 
-            let toplevel_xdg = &self
+            let parent_xdg = &self
                 .testwl
                 .get_surface_data(parent_surface)
                 .unwrap()
                 .xdg()
                 .surface;
-            assert_eq!(&surface_data.popup().parent, toplevel_xdg);
+            assert_eq!(surface_data.popup().parent.id(), parent_xdg.id());
 
             let pos = &surface_data.popup().positioner_state;
-            assert_eq!(pos.size.as_ref().unwrap(), &testwl::Vec2 { x: 50, y: 50 });
+            if check_size_and_pos {
+                assert_eq!(
+                    pos.size.as_ref().unwrap(),
+                    &testwl::Vec2 {
+                        x: (dims.width as f64 / scale) as i32,
+                        y: (dims.height as f64 / scale) as i32
+                    }
+                );
 
-            let parent_win = &self.connection().windows[&parent_window];
-            assert_eq!(
-                pos.anchor_rect.as_ref().unwrap(),
-                &testwl::Rect {
-                    size: testwl::Vec2 {
-                        x: parent_win.dims.width as _,
-                        y: parent_win.dims.height as _
-                    },
-                    offset: testwl::Vec2::default()
-                }
-            );
-            assert_eq!(
-                pos.offset,
-                testwl::Vec2 {
-                    x: (dims.x - parent_win.dims.x) as _,
-                    y: (dims.y - parent_win.dims.y) as _
-                }
-            );
+                let parent_win = &self.connection().windows[&parent_window];
+                assert_eq!(
+                    pos.anchor_rect.as_ref().unwrap(),
+                    &testwl::Rect {
+                        size: testwl::Vec2 {
+                            x: (parent_win.dims.width as f64 / scale) as i32,
+                            y: (parent_win.dims.height as f64 / scale) as i32
+                        },
+                        offset: testwl::Vec2::default()
+                    }
+                );
+                assert_eq!(
+                    pos.offset,
+                    testwl::Vec2 {
+                        x: ((dims.x - parent_win.dims.x) as f64 / scale) as i32,
+                        y: ((dims.y - parent_win.dims.y) as f64 / scale) as i32
+                    }
+                );
+            }
             assert_eq!(pos.anchor, xdg_positioner::Anchor::TopLeft);
             assert_eq!(pos.gravity, xdg_positioner::Gravity::BottomRight);
         }
@@ -851,8 +919,10 @@ fn popup_flow_simple() {
     let (_, toplevel_id) = f.create_toplevel(&compositor, win_toplevel);
 
     let win_popup = unsafe { Window::new(2) };
-    let (popup_surface, popup_id) =
-        f.create_popup(&compositor, win_popup, win_toplevel, toplevel_id, 10, 10);
+    let (popup_surface, popup_id) = f.create_popup(
+        &compositor,
+        PopupBuilder::new(win_popup, win_toplevel, toplevel_id),
+    );
 
     f.satellite.unmap_window(win_popup);
     f.satellite.destroy_window(win_popup);
@@ -911,7 +981,6 @@ fn pass_through_globals() {
         ZwpLinuxDmabufV1,
         ZwpRelativePointerManagerV1,
         ZxdgOutputManagerV1,
-        WpViewporter,
         WlDrm,
         ZwpPointerConstraintsV1,
         XwaylandShellV1,
@@ -969,7 +1038,7 @@ fn popup_window_changes_surface() {
     let (_, toplevel_id) = f.create_toplevel(&comp, t_win);
 
     let win = unsafe { Window::new(2) };
-    let (surface, old_id) = f.create_popup(&comp, win, t_win, toplevel_id, 0, 0);
+    let (surface, old_id) = f.create_popup(&comp, PopupBuilder::new(win, t_win, toplevel_id));
 
     f.satellite.unmap_window(win);
     surface.obj.destroy();
@@ -1018,7 +1087,7 @@ fn override_redirect_window_after_toplevel_close() {
 
     let win2 = unsafe { Window::new(2) };
     let (buffer, surface) = comp.create_surface();
-    f.new_window(win2, true, WindowData::default(), None);
+    f.new_window(win2, true, WindowData::default());
     f.map_window(&comp, win2, &surface.obj, &buffer);
     let second = f.check_new_surface();
     let data = f.testwl.get_surface_data(second).unwrap();
@@ -1328,7 +1397,18 @@ fn override_redirect_choose_hover_window() {
 
     let win3 = unsafe { Window::new(3) };
     let (buffer, surface) = comp.create_surface();
-    f.new_window(win3, true, WindowData::default(), None);
+    f.new_window(
+        win3,
+        true,
+        WindowData {
+            dims: WindowDims {
+                width: 1,
+                height: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
     f.map_window(&comp, win3, &surface.obj, &buffer);
     f.run();
     let id3 = f.check_new_surface();
@@ -1385,7 +1465,8 @@ fn output_offset() {
     }
 
     let popup = unsafe { Window::new(2) };
-    let (p_surface, p_id) = f.create_popup(&comp, popup, window, t_id, 510, 110);
+    let (p_surface, p_id) =
+        f.create_popup(&comp, PopupBuilder::new(popup, window, t_id).x(510).y(110));
     f.testwl.move_surface_to_output(p_id, &output);
     f.run();
     let data = f.testwl.get_surface_data(p_id).unwrap();
@@ -1456,7 +1537,7 @@ fn reposition_popup() {
     let (_, t_id) = f.create_toplevel(&comp, toplevel);
 
     let popup = unsafe { Window::new(2) };
-    let (_, p_id) = f.create_popup(&comp, popup, toplevel, t_id, 20, 40);
+    let (_, p_id) = f.create_popup(&comp, PopupBuilder::new(popup, toplevel, t_id).x(20).y(40));
 
     f.satellite.reconfigure_window(x::ConfigureNotifyEvent::new(
         popup,
@@ -1493,17 +1574,27 @@ fn reposition_popup() {
 }
 
 #[test]
-fn ignore_toplevel_reconfigure() {
+fn toplevel_reconfigure() {
     let (mut f, comp) = TestFixture::new_with_compositor();
     let toplevel = unsafe { Window::new(1) };
-    let _ = f.create_toplevel(&comp, toplevel);
+    let (_, surface) = f.create_toplevel(&comp, toplevel);
+
+    {
+        let data = f
+            .testwl
+            .get_surface_data(surface)
+            .expect("Missing surface data");
+        let viewport = data.viewport.as_ref().expect("Missing viewport");
+        assert_eq!(viewport.width, 100);
+        assert_eq!(viewport.height, 100);
+    }
 
     f.satellite.reconfigure_window(x::ConfigureNotifyEvent::new(
         toplevel,
         toplevel,
         x::WINDOW_NONE,
-        40,  // x
-        60,  // y
+        0,   // x
+        0,   // y
         80,  // width
         100, // height
         0,
@@ -1511,16 +1602,13 @@ fn ignore_toplevel_reconfigure() {
     ));
 
     f.run();
-    let win_data = &f.connection().windows[&toplevel];
-    assert_eq!(
-        win_data.dims,
-        WindowDims {
-            x: 0,
-            y: 0,
-            width: 100,
-            height: 100
-        }
-    );
+    let data = f
+        .testwl
+        .get_surface_data(surface)
+        .expect("Missing surface data");
+    let viewport = data.viewport.as_ref().expect("Missing viewport");
+    assert_eq!(viewport.width, 80);
+    assert_eq!(viewport.height, 100);
 }
 
 type EventMatcher<'a, Event> = Box<dyn FnMut(&Event) -> bool + 'a>;
@@ -1676,7 +1764,7 @@ fn fullscreen_heuristic() {
             },
             fullscreen: false,
         };
-        f.new_window(window, override_redirect, data, None);
+        f.new_window(window, override_redirect, data);
         f.map_window(&comp, window, &surface.obj, &buffer);
         f.run();
         let id = f.check_new_surface();
@@ -1703,6 +1791,455 @@ fn fullscreen_heuristic() {
 
     check_fullscreen(2, false);
     check_fullscreen(3, true);
+}
+
+#[track_caller]
+fn check_output_position_event(output: &TestObject<WlOutput>, x: i32, y: i32) {
+    let events = std::mem::take(&mut *output.data.events.lock().unwrap());
+    assert!(!events.is_empty());
+    let mut done = false;
+    let mut geo = false;
+    for event in events {
+        match event {
+            wl_output::Event::Geometry {
+                x: geo_x, y: geo_y, ..
+            } => {
+                assert_eq!(geo_x, x);
+                assert_eq!(geo_y, y);
+                geo = true;
+            }
+            wl_output::Event::Done => {
+                done = true;
+            }
+            _ => {}
+        }
+    }
+
+    assert!(geo, "Didn't get geometry event");
+    assert!(done, "Didn't get done event");
+}
+
+#[test]
+fn negative_output_position() {
+    let mut f = TestFixture::new();
+    std::mem::take(&mut *f.registry.data.events.lock().unwrap());
+    let (output, _) = f.new_output(-500, -500);
+    f.run();
+    f.run();
+    check_output_position_event(&output, 0, 0);
+
+    let (output2, _) = f.new_output(0, 0);
+    f.run();
+    f.run();
+    check_output_position_event(&output2, 500, 500);
+    assert!(output.data.events.lock().unwrap().is_empty());
+
+    let (output3, _) = f.new_output(500, 500);
+    f.run();
+    f.run();
+    check_output_position_event(&output3, 1000, 1000);
+    assert!(output.data.events.lock().unwrap().is_empty());
+    assert!(output2.data.events.lock().unwrap().is_empty());
+}
+
+#[test]
+fn negative_output_position_update_offset() {
+    let mut f = TestFixture::new();
+    std::mem::take(&mut *f.registry.data.events.lock().unwrap());
+
+    let (output, _) = f.new_output(-500, -500);
+    f.run();
+    f.run();
+    check_output_position_event(&output, 0, 0);
+
+    let (output2, _) = f.new_output(0, -1000);
+    f.run();
+    f.run();
+    check_output_position_event(&output, 0, 500);
+    check_output_position_event(&output2, 500, 0);
+
+    let (output3, _) = f.new_output(-1000, 0);
+    f.run();
+    f.run();
+    check_output_position_event(&output, 500, 500);
+    check_output_position_event(&output2, 1000, 0);
+    check_output_position_event(&output3, 0, 1000);
+}
+
+#[test]
+fn negative_output_xdg_position_update_offset() {
+    let mut f = TestFixture::new();
+    std::mem::take(&mut *f.registry.data.events.lock().unwrap());
+    let xdg = f.enable_xdg_output();
+
+    let (output, _) = f.new_output(-500, -500);
+    f.run();
+    f.run();
+    check_output_position_event(&output, 0, 0);
+
+    let (output2, output_s) = f.new_output(0, 0);
+    let xdg_output = f.create_xdg_output(&xdg, output2.obj);
+    f.testwl.move_xdg_output(&output_s, 0, -1000);
+    f.run();
+    f.run();
+    check_output_position_event(&output, 0, 500);
+
+    let mut found = false;
+    let mut first = false;
+    for event in std::mem::take(&mut *xdg_output.data.events.lock().unwrap()) {
+        if let zxdg_output_v1::Event::LogicalPosition { x, y } = event {
+            // Testwl sends a logical position event when the output is first created
+            // We are interested in the second one generated by satellite
+            if !first {
+                first = true;
+                continue;
+            }
+            assert_eq!(x, 500);
+            assert_eq!(y, 0);
+            found = true;
+            break;
+        }
+    }
+    assert!(found, "Did not get xdg output logical position");
+    found = false;
+    for event in std::mem::take(&mut *output2.data.events.lock().unwrap()) {
+        if let wl_output::Event::Done = event {
+            found = true;
+            break;
+        }
+    }
+    assert!(found, "Did not get done event");
+}
+
+#[test]
+fn negative_output_position_remove_offset() {
+    let mut f = TestFixture::new();
+    std::mem::take(&mut *f.registry.data.events.lock().unwrap());
+
+    let (c_output, s_output) = f.new_output(-500, -500);
+    f.run();
+    f.run();
+    check_output_position_event(&c_output, 0, 0);
+
+    f.testwl.move_output(&s_output, 500, 500);
+    f.run();
+    f.run();
+    check_output_position_event(&c_output, 500, 500);
+}
+
+#[test]
+fn scaled_output_popup() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+
+    let (_, output) = f.new_output(0, 0);
+    let scale = 2;
+    output.scale(scale);
+    output.done();
+    f.run();
+    f.run();
+
+    let toplevel = unsafe { Window::new(1) };
+    let (_, toplevel_id) = f.create_toplevel(&comp, toplevel);
+    f.testwl.move_surface_to_output(toplevel_id, &output);
+    f.run();
+
+    let popup = unsafe { Window::new(2) };
+    let builder = PopupBuilder::new(popup, toplevel, toplevel_id)
+        .x(50)
+        .y(50)
+        .scale(scale);
+    let initial_dims = builder.dims;
+    let (_, popup_id) = f.create_popup(&comp, builder);
+    f.testwl.move_surface_to_output(popup_id, &output);
+    f.run();
+    assert_eq!(
+        initial_dims,
+        f.connection().window(popup).dims,
+        "X11 dimensions changed after configure"
+    );
+}
+
+#[test]
+fn fractional_scale_popup() {
+    let mut f = TestFixture::new_pre_connect(|testwl| {
+        testwl.enable_fractional_scale();
+    });
+    let comp = f.compositor();
+
+    let toplevel = unsafe { Window::new(1) };
+    let (_, toplevel_id) = f.create_toplevel(&comp, toplevel);
+    let surface_data = f
+        .testwl
+        .get_surface_data(toplevel_id)
+        .expect("No surface data");
+    let fractional = surface_data
+        .fractional
+        .as_ref()
+        .expect("No fractional scale for surface");
+
+    fractional.preferred_scale(180); // 1.5 scale
+    f.run();
+    f.run();
+
+    let popup = unsafe { Window::new(2) };
+    let builder = PopupBuilder::new(popup, toplevel, toplevel_id)
+        .x(60)
+        .y(60)
+        .width(60)
+        .height(60)
+        .scale(1.5);
+    let initial_dims = builder.dims;
+    f.create_popup(&comp, builder);
+    f.run();
+    assert_eq!(
+        initial_dims,
+        f.connection().window(popup).dims,
+        "X11 dimensions changed after configure"
+    );
+}
+
+#[test]
+fn scaled_output_small_popup() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+
+    let (_, output) = f.new_output(0, 0);
+    output.scale(2);
+    output.done();
+    f.run();
+    f.run();
+
+    let toplevel = unsafe { Window::new(1) };
+    let (_, toplevel_id) = f.create_toplevel(&comp, toplevel);
+    f.testwl.move_surface_to_output(toplevel_id, &output);
+    f.run();
+
+    let popup = unsafe { Window::new(2) };
+    let builder = PopupBuilder::new(popup, toplevel, toplevel_id)
+        .x(50)
+        .y(50)
+        .width(1)
+        .height(1)
+        .check_size_and_pos(false);
+
+    let (_, popup_id) = f.create_popup(&comp, builder);
+    f.testwl.move_surface_to_output(popup_id, &output);
+    f.run();
+
+    let dims = f.connection().window(popup).dims;
+
+    assert!(dims.width > 0);
+    assert!(dims.height > 0);
+}
+
+#[test]
+fn fractional_scale_small_popup() {
+    let mut f = TestFixture::new_pre_connect(|testwl| {
+        testwl.enable_fractional_scale();
+    });
+    let comp = f.compositor();
+
+    let toplevel = unsafe { Window::new(1) };
+    let (_, toplevel_id) = f.create_toplevel(&comp, toplevel);
+    let data = f.testwl.get_surface_data(toplevel_id).unwrap();
+    let fractional = data
+        .fractional
+        .as_ref()
+        .expect("Missing fracitonal scale data");
+    fractional.preferred_scale(180); // 1.5 scale
+    f.run();
+    f.run();
+
+    {
+        let data = f.testwl.get_surface_data(toplevel_id).unwrap();
+        let viewport = data.viewport.as_ref().expect("Missing viewport");
+        assert_eq!(viewport.width, 66);
+        assert_eq!(viewport.height, 66);
+    }
+
+    let popup = unsafe { Window::new(2) };
+    let builder = PopupBuilder::new(popup, toplevel, toplevel_id)
+        .width(1)
+        .height(1)
+        .check_size_and_pos(false);
+
+    let (_, popup_id) = f.create_popup(&comp, builder);
+    let dims = f.connection().window(popup).dims;
+    assert!(dims.width > 0);
+    assert!(dims.height > 0);
+
+    let data = f
+        .testwl
+        .get_surface_data(popup_id)
+        .expect("Missing popup data");
+    let pos = &data.popup().positioner_state;
+    assert_eq!(pos.size.unwrap(), testwl::Vec2 { x: 1, y: 1 });
+
+    f.satellite.reconfigure_window(x::ConfigureNotifyEvent::new(
+        popup,
+        popup,
+        x::WINDOW_NONE,
+        0,
+        0,
+        2,
+        1,
+        0,
+        true,
+    ));
+    f.run();
+    f.run();
+
+    let dims = f.connection().window(popup).dims;
+    assert!(dims.width > 0);
+    assert!(dims.height > 0);
+
+    let data = f
+        .testwl
+        .get_surface_data(popup_id)
+        .expect("Missing popup data");
+    let pos = &data.popup().positioner_state;
+    assert_eq!(pos.size.unwrap(), testwl::Vec2 { x: 1, y: 1 });
+}
+
+#[test]
+fn toplevel_size_limits_scaled() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+
+    let (_, output) = f.new_output(0, 0);
+    output.scale(2);
+    output.done();
+    f.run();
+    f.run();
+
+    let window = unsafe { Window::new(1) };
+    let (buffer, surface) = comp.create_surface();
+    let data = WindowData {
+        mapped: true,
+        dims: WindowDims {
+            width: 50,
+            height: 50,
+            ..Default::default()
+        },
+        fullscreen: false,
+    };
+    f.new_window(window, false, data);
+    f.satellite.set_size_hints(
+        window,
+        super::WmNormalHints {
+            min_size: Some(WinSize {
+                width: 20,
+                height: 20,
+            }),
+            max_size: Some(WinSize {
+                width: 100,
+                height: 100,
+            }),
+        },
+    );
+
+    f.map_window(&comp, window, &surface.obj, &buffer);
+    f.run();
+
+    let id = f.check_new_surface();
+    f.testwl.configure_toplevel(id, 50, 50, vec![]);
+    f.run();
+
+    f.testwl.move_surface_to_output(id, &output);
+    f.run();
+
+    let data = f.testwl.get_surface_data(id).unwrap();
+    let toplevel = data.toplevel();
+    assert_eq!(toplevel.min_size, Some(testwl::Vec2 { x: 10, y: 10 }));
+    assert_eq!(toplevel.max_size, Some(testwl::Vec2 { x: 50, y: 50 }));
+
+    f.satellite.set_size_hints(
+        window,
+        super::WmNormalHints {
+            min_size: Some(WinSize {
+                width: 40,
+                height: 40,
+            }),
+            max_size: Some(WinSize {
+                width: 200,
+                height: 200,
+            }),
+        },
+    );
+    f.run();
+    let data = f.testwl.get_surface_data(id).unwrap();
+    let toplevel = data.toplevel();
+    assert_eq!(toplevel.min_size, Some(testwl::Vec2 { x: 20, y: 20 }));
+    assert_eq!(toplevel.max_size, Some(testwl::Vec2 { x: 100, y: 100 }));
+}
+
+#[test]
+fn subpopup_positioning() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    TestObject::<WlPointer>::from_request(&comp.seat.obj, wl_seat::Request::GetPointer {});
+    let win_toplevel = unsafe { Window::new(1) };
+    let (_, id_toplevel) = f.create_toplevel(&comp, win_toplevel);
+
+    f.testwl.move_pointer_to(id_toplevel, 0.0, 0.0);
+    f.run();
+
+    let win_popup = unsafe { Window::new(2) };
+    let (_, id_popup) = f.create_popup(
+        &comp,
+        PopupBuilder::new(win_popup, win_toplevel, id_toplevel)
+            .x(25)
+            .y(25),
+    );
+
+    f.testwl.move_pointer_to(id_popup, 1.0, 1.0);
+    f.run();
+
+    println!("{:?}", f.satellite.last_hovered);
+
+    let win_subpopup = unsafe { Window::new(3) };
+
+    f.create_popup(
+        &comp,
+        PopupBuilder::new(win_subpopup, win_toplevel, id_toplevel)
+            .x(50)
+            .y(50),
+    );
+
+    let dims = f.connection().window(win_subpopup).dims;
+    assert_eq!(dims.x, 50);
+    assert_eq!(dims.y, 50);
+}
+
+#[test]
+fn transient_for_toplevel() {
+    let (mut f, comp) = TestFixture::new_with_compositor();
+    let toplevel = unsafe { Window::new(1) };
+    let (_, toplevel_id) = f.create_toplevel(&comp, toplevel);
+
+    let sub_toplevel = unsafe { Window::new(2) };
+    let (buffer, surface) = comp.create_surface();
+    f.new_window(
+        sub_toplevel,
+        false,
+        WindowData {
+            mapped: true,
+            dims: WindowDims {
+                width: 50,
+                height: 50,
+                ..Default::default()
+            },
+            fullscreen: false,
+        },
+    );
+
+    f.satellite.set_transient_for(sub_toplevel, toplevel);
+    f.map_window(&comp, sub_toplevel, &surface.obj, &buffer);
+    f.run();
+    let id = f.check_new_surface();
+    let toplevel_data = f.testwl.get_surface_data(toplevel_id).unwrap();
+    let sub_data = f.testwl.get_surface_data(id).unwrap();
+    assert_eq!(
+        sub_data.toplevel().parent,
+        Some(toplevel_data.toplevel().toplevel.clone())
+    );
 }
 
 /// See Pointer::handle_event for an explanation.

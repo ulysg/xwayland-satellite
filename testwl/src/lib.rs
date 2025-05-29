@@ -7,6 +7,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use wayland_protocols::{
     wp::{
+        fractional_scale::v1::server::{
+            wp_fractional_scale_manager_v1::{self, WpFractionalScaleManagerV1},
+            wp_fractional_scale_v1::{self, WpFractionalScaleV1},
+        },
         linux_dmabuf::zv1::server::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
         pointer_constraints::zv1::server::zwp_pointer_constraints_v1::ZwpPointerConstraintsV1,
         relative_pointer::zv1::server::zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1,
@@ -20,9 +24,20 @@ use wayland_protocols::{
             zwp_tablet_tool_v2::{self, ZwpTabletToolV2},
             zwp_tablet_v2::ZwpTabletV2,
         },
-        viewporter::server::wp_viewporter::WpViewporter,
+        viewporter::server::{
+            wp_viewport::{self, WpViewport},
+            wp_viewporter::{self, WpViewporter},
+        },
     },
     xdg::{
+        activation::v1::server::{
+            xdg_activation_token_v1::{self, XdgActivationTokenV1},
+            xdg_activation_v1::{self, XdgActivationV1},
+        },
+        decoration::zv1::server::{
+            zxdg_decoration_manager_v1::{self, ZxdgDecorationManagerV1},
+            zxdg_toplevel_decoration_v1::{self, ZxdgToplevelDecorationV1},
+        },
         shell::server::{
             xdg_popup::{self, XdgPopup},
             xdg_positioner::{self, XdgPositioner},
@@ -58,7 +73,7 @@ use wayland_server::{
         wl_shm_pool::WlShmPool,
         wl_surface::WlSurface,
     },
-    Client, Dispatch, Display, DisplayHandle, GlobalDispatch, Resource,
+    Client, Dispatch, Display, DisplayHandle, GlobalDispatch, Resource, WEnum,
 };
 use wl_drm::server::wl_drm::WlDrm;
 
@@ -71,12 +86,21 @@ pub struct BufferDamage {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+pub struct Viewport {
+    pub width: i32,
+    pub height: i32,
+    viewport: WpViewport,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub struct SurfaceData {
     pub surface: WlSurface,
     pub buffer: Option<WlBuffer>,
     pub last_damage: Option<BufferDamage>,
     pub role: Option<SurfaceRole>,
     pub last_enter_serial: Option<u32>,
+    pub fractional: Option<WpFractionalScaleV1>,
+    pub viewport: Option<Viewport>,
 }
 
 impl SurfaceData {
@@ -113,12 +137,17 @@ pub enum SurfaceRole {
 pub struct Toplevel {
     pub xdg: XdgSurfaceData,
     pub toplevel: XdgToplevel,
+    pub parent: Option<XdgToplevel>,
     pub min_size: Option<Vec2>,
     pub max_size: Option<Vec2>,
     pub states: Vec<xdg_toplevel::State>,
     pub closed: bool,
     pub title: Option<String>,
     pub app_id: Option<String>,
+    pub decoration: Option<(
+        ZxdgToplevelDecorationV1,
+        Option<zxdg_toplevel_decoration_v1::Mode>,
+    )>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -176,6 +205,14 @@ struct KeyboardState {
     current_focus: Option<SurfaceId>,
 }
 
+#[derive(Default)]
+struct ActivationTokenData {
+    serial: Option<(u32, WlSeat)>,
+    app_id: Option<String>,
+    surface: Option<WlSurface>,
+    constructed: bool,
+}
+
 struct State {
     surfaces: HashMap<SurfaceId, SurfaceData>,
     outputs: HashMap<WlOutput, Output>,
@@ -185,12 +222,16 @@ struct State {
     last_surface_id: Option<SurfaceId>,
     last_output: Option<WlOutput>,
     callbacks: Vec<WlCallback>,
+    seat: Option<WlSeat>,
     pointer: Option<WlPointer>,
     keyboard: Option<KeyboardState>,
     configure_serial: u32,
     selection: Option<WlDataSource>,
     data_device_man: Option<WlDataDeviceManager>,
     data_device: Option<WlDataDevice>,
+    xdg_activation: Option<XdgActivationV1>,
+    valid_tokens: HashSet<String>,
+    token_counter: u32,
 }
 
 impl Default for State {
@@ -204,12 +245,16 @@ impl Default for State {
             last_surface_id: None,
             last_output: None,
             callbacks: Vec::new(),
+            seat: None,
             pointer: None,
             keyboard: None,
             configure_serial: 0,
             selection: None,
             data_device_man: None,
             data_device: None,
+            xdg_activation: None,
+            valid_tokens: HashSet::new(),
+            token_counter: 0,
         }
     }
 }
@@ -246,11 +291,9 @@ impl State {
             keyboard.leave(self.configure_serial, &self.surfaces[id].surface);
         }
 
-        keyboard.enter(
-            self.configure_serial,
-            &self.surfaces[&surface_id].surface,
-            Vec::default(),
-        );
+        let surface = self.surfaces.get_mut(&surface_id).unwrap();
+        keyboard.enter(self.configure_serial, &surface.surface, Vec::default());
+        surface.last_enter_serial = Some(self.configure_serial);
 
         *current_focus = Some(surface_id);
     }
@@ -267,8 +310,12 @@ impl State {
         }
     }
 
+    fn get_focused(&self) -> Option<SurfaceId> {
+        self.keyboard.as_ref()?.current_focus
+    }
+
     #[track_caller]
-    pub fn configure_popup(&mut self, surface_id: SurfaceId) {
+    fn configure_popup(&mut self, surface_id: SurfaceId) {
         let surface = self.surfaces.get_mut(&surface_id).unwrap();
         let Some(SurfaceRole::Popup(p)) = &mut surface.role else {
             panic!("Surface does not have popup role: {:?}", surface.role);
@@ -290,6 +337,15 @@ impl State {
             Some(SurfaceRole::Toplevel(t)) => t,
             other => panic!("Surface does not have toplevel role: {:?}", other),
         }
+    }
+
+    #[track_caller]
+    fn popup_done(&mut self, surface_id: SurfaceId) {
+        let surface = self.surfaces.get_mut(&surface_id).unwrap();
+        let Some(SurfaceRole::Popup(p)) = &mut surface.role else {
+            panic!("Surface does not have popup role: {:?}", surface.role);
+        };
+        p.popup.popup_done();
     }
 }
 
@@ -351,9 +407,11 @@ impl Server {
         dh.create_global::<State, WlSeat, _>(5, ());
         dh.create_global::<State, WlDataDeviceManager, _>(3, ());
         dh.create_global::<State, ZwpTabletManagerV2, _>(1, ());
+        dh.create_global::<State, XdgActivationV1, _>(1, ());
+        dh.create_global::<State, ZxdgDecorationManagerV1, _>(1, ());
+        dh.create_global::<State, WpViewporter, _>(1, ());
         global_noop!(ZwpLinuxDmabufV1);
         global_noop!(ZwpRelativePointerManagerV1);
-        global_noop!(WpViewporter);
         global_noop!(ZwpPointerConstraintsV1);
 
         struct HandlerData;
@@ -402,7 +460,7 @@ impl Server {
 
         if noops {
             dh.backend_handle()
-                .create_global(&interface, interface.version, Arc::new(Handler));
+                .create_global(interface, interface.version, Arc::new(Handler));
         }
 
         Self {
@@ -487,8 +545,19 @@ impl Server {
     }
 
     #[track_caller]
+    pub fn get_focused(&self) -> Option<SurfaceId> {
+        self.state.get_focused()
+    }
+
+    #[track_caller]
     pub fn configure_popup(&mut self, surface_id: SurfaceId) {
         self.state.configure_popup(surface_id);
+        self.display.flush_clients().unwrap();
+    }
+
+    #[track_caller]
+    pub fn popup_done(&mut self, surface_id: SurfaceId) {
+        self.state.popup_done(surface_id);
         self.display.flush_clients().unwrap();
     }
 
@@ -564,8 +633,7 @@ impl Server {
                 }
             };
 
-        while !pending_ret.is_empty() {
-            let (mime, pending) = pending_ret.pop().unwrap();
+        while let Some((mime, pending)) = pending_ret.pop() {
             match pending {
                 Some(pending) => try_transfer(&mut pending_ret, mime, pending),
                 None => {
@@ -678,6 +746,12 @@ impl Server {
         xdg.done();
         self.display.flush_clients().unwrap();
     }
+
+    pub fn enable_fractional_scale(&mut self) {
+        self.dh
+            .create_global::<State, WpFractionalScaleManagerV1, _>(1, ());
+        self.display.flush_clients().unwrap();
+    }
 }
 
 #[derive(Clone, Eq, PartialEq, Debug)]
@@ -691,6 +765,9 @@ simple_global_dispatch!(WlCompositor);
 simple_global_dispatch!(XdgWmBase);
 simple_global_dispatch!(ZxdgOutputManagerV1);
 simple_global_dispatch!(ZwpTabletManagerV2);
+simple_global_dispatch!(ZxdgDecorationManagerV1);
+simple_global_dispatch!(WpViewporter);
+simple_global_dispatch!(WpFractionalScaleManagerV1);
 
 impl Dispatch<ZwpTabletManagerV2, ()> for State {
     fn request(
@@ -957,7 +1034,7 @@ impl Dispatch<WlDataDeviceManager, ()> for State {
 
 impl GlobalDispatch<WlSeat, ()> for State {
     fn bind(
-        _: &mut Self,
+        state: &mut Self,
         _: &DisplayHandle,
         _: &Client,
         resource: wayland_server::New<WlSeat>,
@@ -966,6 +1043,7 @@ impl GlobalDispatch<WlSeat, ()> for State {
     ) {
         let seat = data_init.init(resource, ());
         seat.capabilities(wl_seat::Capability::Pointer | wl_seat::Capability::Keyboard);
+        state.seat = Some(seat);
     }
 }
 
@@ -1147,6 +1225,13 @@ impl Dispatch<XdgToplevel, SurfaceId> for State {
                 };
                 toplevel.app_id = app_id.into();
             }
+            xdg_toplevel::Request::SetParent { parent } => {
+                let data = state.surfaces.get_mut(surface_id).unwrap();
+                let Some(SurfaceRole::Toplevel(toplevel)) = &mut data.role else {
+                    unreachable!();
+                };
+                toplevel.parent = parent;
+            }
             other => todo!("unhandled request {other:?}"),
         }
     }
@@ -1170,12 +1255,14 @@ impl Dispatch<XdgSurface, SurfaceId> for State {
                 let t = Toplevel {
                     xdg: XdgSurfaceData::new(resource.clone()),
                     toplevel,
+                    parent: None,
                     min_size: None,
                     max_size: None,
                     states: Vec::new(),
                     closed: false,
                     title: None,
                     app_id: None,
+                    decoration: None,
                 };
                 let data = state.surfaces.get_mut(surface_id).unwrap();
                 data.role = Some(SurfaceRole::Toplevel(t));
@@ -1185,14 +1272,33 @@ impl Dispatch<XdgSurface, SurfaceId> for State {
                 parent,
                 positioner,
             } => {
+                let positioner_state =
+                    state.positioners[&PositionerId(positioner.id().protocol_id())].clone();
+                if positioner_state
+                    .size
+                    .is_none_or(|size| size.x <= 0 || size.y <= 0)
+                {
+                    // TODO: figure out why the client.kill here doesn't make satellite print the error message
+                    let message =
+                        format!("positioner had an invalid size {:?}", positioner_state.size);
+                    eprintln!("{message}");
+                    client.kill(
+                        dh,
+                        ProtocolError {
+                            code: xdg_positioner::Error::InvalidInput.into(),
+                            object_id: positioner.id().protocol_id(),
+                            object_interface: XdgPositioner::interface().name.to_string(),
+                            message,
+                        },
+                    );
+                    return;
+                }
                 let popup = data_init.init(id, *surface_id);
                 let p = Popup {
                     xdg: XdgSurfaceData::new(resource.clone()),
                     popup,
                     parent: parent.unwrap(),
-                    positioner_state: state.positioners
-                        [&PositionerId(positioner.id().protocol_id())]
-                        .clone(),
+                    positioner_state,
                 };
                 let data = state.surfaces.get_mut(surface_id).unwrap();
                 data.role = Some(SurfaceRole::Popup(p));
@@ -1256,11 +1362,11 @@ impl Default for PositionerState {
 impl Dispatch<XdgPositioner, ()> for State {
     fn request(
         state: &mut Self,
-        _: &Client,
+        client: &Client,
         resource: &XdgPositioner,
         request: <XdgPositioner as Resource>::Request,
         _: &(),
-        _: &DisplayHandle,
+        handle: &DisplayHandle,
         _: &mut wayland_server::DataInit<'_, Self>,
     ) {
         let hash_map::Entry::Occupied(mut data) = state
@@ -1271,6 +1377,22 @@ impl Dispatch<XdgPositioner, ()> for State {
         };
         match request {
             xdg_positioner::Request::SetSize { width, height } => {
+                if width <= 0 || height <= 0 {
+                    // TODO: figure out why the client.kill here doesn't make satellite print the error message
+                    let message = format!("positioner had an invalid size {width}x{height}");
+                    eprintln!("{message}");
+                    client.kill(
+                        handle,
+                        ProtocolError {
+                            code: xdg_positioner::Error::InvalidInput.into(),
+                            object_id: resource.id().protocol_id(),
+                            object_interface: XdgPositioner::interface().name.to_string(),
+                            message,
+                        },
+                    );
+                    return;
+                }
+
                 data.get_mut().size = Some(Vec2 {
                     x: width,
                     y: height,
@@ -1429,6 +1551,8 @@ impl Dispatch<WlCompositor, ()> for State {
                         last_damage: None,
                         role: None,
                         last_enter_serial: None,
+                        fractional: None,
+                        viewport: None,
                     },
                 );
                 state.last_surface_id = Some(SurfaceId(id));
@@ -1508,5 +1632,341 @@ impl Dispatch<WlCallback, ()> for State {
         _: &mut wayland_server::DataInit<'_, Self>,
     ) {
         unreachable!()
+    }
+}
+
+impl GlobalDispatch<XdgActivationV1, ()> for State {
+    fn bind(
+        state: &mut Self,
+        _: &DisplayHandle,
+        _: &Client,
+        resource: wayland_server::New<XdgActivationV1>,
+        _: &(),
+        data_init: &mut wayland_server::DataInit<'_, Self>,
+    ) {
+        state.xdg_activation = Some(data_init.init(resource, ()));
+    }
+}
+
+impl Dispatch<XdgActivationV1, ()> for State {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        _: &XdgActivationV1,
+        request: <XdgActivationV1 as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        data_init: &mut wayland_server::DataInit<'_, Self>,
+    ) {
+        match request {
+            xdg_activation_v1::Request::Destroy => {}
+            xdg_activation_v1::Request::GetActivationToken { id } => {
+                data_init.init(id, Mutex::new(ActivationTokenData::default()));
+            }
+            xdg_activation_v1::Request::Activate { token, surface } => {
+                if state.valid_tokens.remove(&token) {
+                    let surface_id = SurfaceId(surface.id().protocol_id());
+                    state.focus_toplevel(surface_id);
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl Dispatch<XdgActivationTokenV1, Mutex<ActivationTokenData>> for State {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        token: &XdgActivationTokenV1,
+        request: <XdgActivationTokenV1 as Resource>::Request,
+        data: &Mutex<ActivationTokenData>,
+        _: &DisplayHandle,
+        _: &mut wayland_server::DataInit<'_, Self>,
+    ) {
+        let mut data = data.lock().unwrap();
+        match request {
+            xdg_activation_token_v1::Request::SetSerial { serial, seat } => {
+                if data.constructed {
+                    token.post_error(
+                        xdg_activation_token_v1::Error::AlreadyUsed,
+                        "The activation token has already been constructed",
+                    );
+                    return;
+                }
+
+                data.serial = Some((serial, seat));
+            }
+            xdg_activation_token_v1::Request::SetAppId { app_id } => {
+                if data.constructed {
+                    token.post_error(
+                        xdg_activation_token_v1::Error::AlreadyUsed,
+                        "The activation token has already been constructed",
+                    );
+                    return;
+                }
+
+                data.app_id = Some(app_id);
+            }
+            xdg_activation_token_v1::Request::SetSurface { surface } => {
+                if data.constructed {
+                    token.post_error(
+                        xdg_activation_token_v1::Error::AlreadyUsed,
+                        "The activation token has already been constructed",
+                    );
+                    return;
+                }
+
+                data.surface = Some(surface);
+            }
+            xdg_activation_token_v1::Request::Commit => {
+                if data.constructed {
+                    token.post_error(
+                        xdg_activation_token_v1::Error::AlreadyUsed,
+                        "The activation token has already been constructed",
+                    );
+                    return;
+                }
+                data.constructed = true;
+
+                // Require a valid serial, otherwise ignore the activation.
+                // This matches niri's behavior: https://github.com/YaLTeR/niri/blob/5e549e13238a853f8860e29621ab6b31ee1b9ee4/src/handlers/mod.rs#L712-L723
+                let valid = if let (Some((serial, seat)), Some(surface_data)) = (
+                    data.serial.take(),
+                    data.surface.take().and_then(|surface| {
+                        state.surfaces.get(&SurfaceId(surface.id().protocol_id()))
+                    }),
+                ) {
+                    state.seat == Some(seat)
+                        && surface_data
+                            .last_enter_serial
+                            .is_some_and(|last_enter| serial >= last_enter)
+                } else {
+                    false
+                };
+
+                let activation_token = state.token_counter.to_string();
+                state.token_counter += 1;
+                if valid {
+                    state.valid_tokens.insert(activation_token.clone());
+                }
+                token.done(activation_token);
+            }
+            xdg_activation_token_v1::Request::Destroy => {}
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl Dispatch<ZxdgDecorationManagerV1, ()> for State {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        resource: &ZxdgDecorationManagerV1,
+        request: <ZxdgDecorationManagerV1 as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        data_init: &mut wayland_server::DataInit<'_, Self>,
+    ) {
+        match request {
+            zxdg_decoration_manager_v1::Request::GetToplevelDecoration { id, toplevel } => {
+                let surface_id = *toplevel.data::<SurfaceId>().unwrap();
+                let data = state.surfaces.get_mut(&surface_id).unwrap();
+                let Some(SurfaceRole::Toplevel(toplevel)) = &mut data.role else {
+                    unreachable!();
+                };
+                if toplevel.decoration.is_some() {
+                    resource.post_error(
+                        zxdg_toplevel_decoration_v1::Error::AlreadyConstructed,
+                        "Toplevel already has an decoration object",
+                    );
+                    return;
+                }
+                toplevel.decoration = Some((data_init.init(id, surface_id), None));
+            }
+            zxdg_decoration_manager_v1::Request::Destroy => {}
+            _ => todo!(),
+        }
+    }
+}
+
+impl Dispatch<ZxdgToplevelDecorationV1, SurfaceId> for State {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        resource: &ZxdgToplevelDecorationV1,
+        request: <ZxdgToplevelDecorationV1 as Resource>::Request,
+        surface_id: &SurfaceId,
+        _: &DisplayHandle,
+        _: &mut wayland_server::DataInit<'_, Self>,
+    ) {
+        match request {
+            zxdg_toplevel_decoration_v1::Request::SetMode { mode } => {
+                let WEnum::Value(mode) = mode else {
+                    resource.post_error(
+                        zxdg_toplevel_decoration_v1::Error::InvalidMode,
+                        "Invalid decoration mode",
+                    );
+                    return;
+                };
+                if let Some(data) = state.surfaces.get_mut(surface_id) {
+                    let Some(SurfaceRole::Toplevel(toplevel)) = &mut data.role else {
+                        unreachable!();
+                    };
+                    *toplevel
+                        .decoration
+                        .as_mut()
+                        .map(|(_, decoration)| decoration)
+                        .unwrap() = Some(mode);
+                } else {
+                    resource.post_error(
+                        zxdg_toplevel_decoration_v1::Error::Orphaned,
+                        "Toplevel was destroyed",
+                    );
+                }
+            }
+            zxdg_toplevel_decoration_v1::Request::UnsetMode => {
+                if let Some(data) = state.surfaces.get_mut(surface_id) {
+                    let Some(SurfaceRole::Toplevel(toplevel)) = &mut data.role else {
+                        unreachable!();
+                    };
+                    *toplevel
+                        .decoration
+                        .as_mut()
+                        .map(|(_, decoration)| decoration)
+                        .unwrap() = None;
+                } else {
+                    resource.post_error(
+                        zxdg_toplevel_decoration_v1::Error::Orphaned,
+                        "Toplevel was destroyed",
+                    );
+                }
+            }
+            zxdg_toplevel_decoration_v1::Request::Destroy => {
+                if let Some(data) = state.surfaces.get_mut(surface_id) {
+                    let Some(SurfaceRole::Toplevel(toplevel)) = &mut data.role else {
+                        unreachable!();
+                    };
+                    toplevel.decoration = None;
+                } else {
+                    resource.post_error(
+                        zxdg_toplevel_decoration_v1::Error::Orphaned,
+                        "Toplevel was destroyed",
+                    );
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl Dispatch<WpViewporter, ()> for State {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        _: &WpViewporter,
+        request: <WpViewporter as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        data_init: &mut wayland_server::DataInit<'_, Self>,
+    ) {
+        match request {
+            wp_viewporter::Request::GetViewport { surface, id } => {
+                let surface_id = SurfaceId(surface.id().protocol_id());
+                let viewport = data_init.init(id, surface_id);
+                state
+                    .surfaces
+                    .get_mut(&surface_id)
+                    .expect("Unknown surface")
+                    .viewport = Some(Viewport {
+                    viewport,
+                    width: -1,
+                    height: -1,
+                })
+            }
+            wp_viewporter::Request::Destroy => {}
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl Dispatch<WpViewport, SurfaceId> for State {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        viewport: &WpViewport,
+        request: <WpViewport as Resource>::Request,
+        surface_id: &SurfaceId,
+        _: &DisplayHandle,
+        _: &mut wayland_server::DataInit<'_, Self>,
+    ) {
+        match request {
+            wp_viewport::Request::SetDestination { width, height } => {
+                if width == 0 || width < -1 || height == 0 || height < -1 {
+                    panic!(
+                        "Bad viewport width/height ({width}x{height}) - {}",
+                        viewport.id()
+                    );
+                }
+                let viewport = state
+                    .surfaces
+                    .get_mut(surface_id)
+                    .unwrap_or_else(|| panic!("Missing surface id {surface_id:?}"))
+                    .viewport
+                    .as_mut()
+                    .unwrap();
+                viewport.width = width;
+                viewport.height = height;
+            }
+            wp_viewport::Request::Destroy => {
+                if let Some(surface) = state.surfaces.get_mut(surface_id) {
+                    surface.viewport.take();
+                }
+            }
+            _ => unimplemented!("{request:?}"),
+        }
+    }
+}
+
+impl Dispatch<WpFractionalScaleManagerV1, ()> for State {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        _: &WpFractionalScaleManagerV1,
+        request: <WpFractionalScaleManagerV1 as Resource>::Request,
+        _: &(),
+        _: &DisplayHandle,
+        data_init: &mut wayland_server::DataInit<'_, Self>,
+    ) {
+        match request {
+            wp_fractional_scale_manager_v1::Request::GetFractionalScale { id, surface } => {
+                let surface_id = SurfaceId(surface.id().protocol_id());
+                let fractional = data_init.init(id, surface_id);
+                let surface_data = state.surfaces.get_mut(&surface_id).unwrap();
+                surface_data.fractional = Some(fractional);
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl Dispatch<WpFractionalScaleV1, SurfaceId> for State {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        _: &WpFractionalScaleV1,
+        request: <WpFractionalScaleV1 as Resource>::Request,
+        data: &SurfaceId,
+        _: &DisplayHandle,
+        _: &mut wayland_server::DataInit<'_, Self>,
+    ) {
+        match request {
+            wp_fractional_scale_v1::Request::Destroy => {
+                if let Some(surface_data) = state.surfaces.get_mut(data) {
+                    surface_data.fractional.take();
+                }
+            }
+            _ => unreachable!(),
+        }
     }
 }

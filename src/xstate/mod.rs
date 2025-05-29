@@ -1,7 +1,10 @@
+mod settings;
+use settings::Settings;
 mod selection;
 use selection::{Selection, SelectionData};
+use wayland_protocols::xdg::decoration::zv1::client::zxdg_toplevel_decoration_v1;
 
-use crate::{server::WindowAttributes, XConnection};
+use crate::XConnection;
 use bitflags::bitflags;
 use log::{debug, trace, warn};
 use std::collections::HashMap;
@@ -106,9 +109,11 @@ impl WmName {
 pub struct XState {
     connection: Rc<xcb::Connection>,
     atoms: Atoms,
+    window_atoms: WindowTypes,
     root: x::Window,
     wm_window: x::Window,
     selection_data: SelectionData,
+    settings: Settings,
 }
 
 impl XState {
@@ -121,6 +126,7 @@ impl XState {
                     xcb::Extension::Composite,
                     xcb::Extension::RandR,
                     xcb::Extension::XFixes,
+                    xcb::Extension::Res,
                 ],
                 &[],
             )
@@ -182,6 +188,14 @@ impl XState {
                     | SelectionEventMask::SELECTION_CLIENT_CLOSE,
             })
             .unwrap();
+        connection
+            .send_and_check_request(&xcb::xfixes::SelectSelectionInput {
+                window: root,
+                selection: atoms.xsettings,
+                event_mask: SelectionEventMask::SELECTION_WINDOW_DESTROY
+                    | SelectionEventMask::SELECTION_CLIENT_CLOSE,
+            })
+            .unwrap();
         {
             // Setup default cursor theme
             let ctx = CursorContext::new(&connection, screen).unwrap();
@@ -196,23 +210,27 @@ impl XState {
 
         let wm_window = connection.generate_id();
         let selection_data = SelectionData::new(&connection, root);
+        let window_atoms = WindowTypes::intern_all(&connection).unwrap();
+        let settings = Settings::new(&connection, &atoms, root);
 
         let mut r = Self {
             connection,
             wm_window,
             root,
             atoms,
+            window_atoms,
             selection_data,
+            settings,
         };
         r.create_ewmh_window();
+        r.set_xsettings_owner();
         r
     }
 
     pub fn server_state_setup(&self, server_state: &mut super::RealServerState) {
-        let mut c = RealConnection::new(self.connection.clone());
+        let mut c = RealConnection::new(self.connection.clone(), self.atoms.clone());
         c.update_outputs(self.root);
         server_state.set_x_connection(c);
-        server_state.atoms = Some(self.atoms.clone());
     }
 
     fn set_root_property<P: x::PropEl>(&self, property: x::Atom, r#type: x::Atom, data: &[P]) {
@@ -246,7 +264,16 @@ impl XState {
 
         self.set_root_property(self.atoms.wm_check, x::ATOM_WINDOW, &[self.wm_window]);
         self.set_root_property(self.atoms.active_win, x::ATOM_WINDOW, &[x::Window::none()]);
-        self.set_root_property(self.atoms.supported, x::ATOM_ATOM, &[self.atoms.active_win]);
+        self.set_root_property(
+            self.atoms.supported,
+            x::ATOM_ATOM,
+            &[
+                self.atoms.active_win,
+                self.atoms.motif_wm_hints,
+                self.atoms.net_wm_state,
+                self.atoms.wm_fullscreen,
+            ],
+        );
 
         self.connection
             .send_and_check_request(&x::ChangeProperty {
@@ -296,26 +323,39 @@ impl XState {
             match event {
                 xcb::Event::X(x::Event::CreateNotify(e)) => {
                     debug!("new window: {:?}", e);
-                    let parent = e.parent();
-                    let parent = if parent.is_none() || parent == self.root {
-                        None
-                    } else {
-                        Some(parent)
-                    };
-                    server_state.new_window(e.window(), e.override_redirect(), (&e).into(), parent);
+                    server_state.new_window(
+                        e.window(),
+                        e.override_redirect(),
+                        (&e).into(),
+                        self.get_pid(e.window()),
+                    );
                 }
                 xcb::Event::X(x::Event::ReparentNotify(e)) => {
                     debug!("reparent event: {e:?}");
                     if e.parent() == self.root {
+                        let geometry = self.connection.send_request(&x::GetGeometry {
+                            drawable: x::Drawable::Window(e.window()),
+                        });
+                        let attrs = self
+                            .connection
+                            .send_request(&x::GetWindowAttributes { window: e.window() });
+                        let geometry = unwrap_or_skip_bad_window_cont!(self
+                            .connection
+                            .wait_for_reply(geometry));
                         let attrs =
-                            unwrap_or_skip_bad_window_cont!(self.get_window_attributes(e.window()));
+                            unwrap_or_skip_bad_window_cont!(self.connection.wait_for_reply(attrs));
+
                         server_state.new_window(
                             e.window(),
-                            attrs.override_redirect,
-                            attrs.dims,
-                            None,
+                            attrs.override_redirect(),
+                            WindowDims {
+                                x: geometry.x(),
+                                y: geometry.y(),
+                                width: geometry.width(),
+                                height: geometry.height(),
+                            },
+                            self.get_pid(e.window()),
                         );
-                        self.handle_window_attributes(server_state, e.window(), attrs);
                     } else {
                         debug!("destroying window since its parent is no longer root!");
                         server_state.destroy_window(e.window());
@@ -335,9 +375,9 @@ impl XState {
                             value_list: &[x::Cw::EventMask(x::EventMask::PROPERTY_CHANGE)],
                         }
                     ));
-                    let attrs =
-                        unwrap_or_skip_bad_window_cont!(self.get_window_attributes(e.window()));
-                    self.handle_window_attributes(server_state, e.window(), attrs);
+                    unwrap_or_skip_bad_window_cont!(
+                        self.handle_window_properties(server_state, e.window())
+                    );
                     server_state.map_window(e.window());
                 }
                 xcb::Event::X(x::Event::ConfigureNotify(e)) => {
@@ -359,11 +399,11 @@ impl XState {
                     let active_win: &[x::Window] = active_win.value();
                     if active_win[0] == e.window() {
                         // The connection on the server state stores state.
-                        server_state.connection.as_mut().unwrap().focus_window(
-                            x::Window::none(),
-                            None,
-                            self.atoms.clone(),
-                        );
+                        server_state
+                            .connection
+                            .as_mut()
+                            .unwrap()
+                            .focus_window(x::Window::none(), None);
                     }
 
                     unwrap_or_skip_bad_window_cont!(self.connection.send_and_check_request(
@@ -384,20 +424,18 @@ impl XState {
                     self.handle_property_change(e, server_state);
                 }
                 xcb::Event::X(x::Event::ConfigureRequest(e)) => {
-                    if !server_state.can_reconfigure_window(e.window()) {
-                        debug!("ignoring reconfigure request for {:?}", e.window());
-                        continue;
-                    }
                     debug!("{:?} request: {:?}", e.window(), e.value_mask());
 
                     let mut list = Vec::new();
                     let mask = e.value_mask();
 
-                    if mask.contains(x::ConfigWindowMask::X) {
-                        list.push(x::ConfigWindow::X(e.x().into()));
-                    }
-                    if mask.contains(x::ConfigWindowMask::Y) {
-                        list.push(x::ConfigWindow::Y(e.y().into()));
+                    if server_state.can_change_position(e.window()) {
+                        if mask.contains(x::ConfigWindowMask::X) {
+                            list.push(x::ConfigWindow::X(e.x().into()));
+                        }
+                        if mask.contains(x::ConfigWindowMask::Y) {
+                            list.push(x::ConfigWindow::Y(e.y().into()));
+                        }
                     }
                     if mask.contains(x::ConfigWindowMask::WIDTH) {
                         list.push(x::ConfigWindow::Width(e.width().into()));
@@ -448,6 +486,9 @@ impl XState {
                             }
                         }
                     }
+                    x if x == self.atoms.active_win => {
+                        server_state.activate_window(e.window());
+                    }
                     t => warn!("unrecognized message: {t:?}"),
                 },
                 xcb::Event::X(x::Event::MappingNotify(_)) => {}
@@ -469,62 +510,146 @@ impl XState {
         }
     }
 
-    fn get_window_attributes(&self, window: x::Window) -> XResult<WindowAttributes> {
-        let geometry = self.connection.send_request(&x::GetGeometry {
-            drawable: x::Drawable::Window(window),
-        });
-        let attrs = self
-            .connection
-            .send_request(&x::GetWindowAttributes { window });
-
+    fn handle_window_properties(
+        &self,
+        server_state: &mut super::RealServerState,
+        window: x::Window,
+    ) -> XResult<()> {
         let name = self.get_net_wm_name(window);
         let class = self.get_wm_class(window);
-        let wm_hints = self.get_wm_hints(window);
         let size_hints = self.get_wm_size_hints(window);
-
-        let geometry = self.connection.wait_for_reply(geometry)?;
-        debug!("{window:?} geometry: {geometry:?}");
-        let attrs = self.connection.wait_for_reply(attrs)?;
+        let motif_wm_hints = self.get_motif_wm_hints(window);
         let mut title = name.resolve()?;
         if title.is_none() {
             title = self.get_wm_name(window).resolve()?;
         }
 
-        let class = class.resolve()?;
-        let wm_hints = wm_hints.resolve()?;
-        let size_hints = size_hints.resolve()?;
-
-        Ok(WindowAttributes {
-            override_redirect: attrs.override_redirect(),
-            popup_for: None,
-            dims: WindowDims {
-                x: geometry.x(),
-                y: geometry.y(),
-                width: geometry.width(),
-                height: geometry.height(),
-            },
-            title,
-            class,
-            group: wm_hints.and_then(|h| h.window_group),
-            size_hints,
-        })
-    }
-
-    fn handle_window_attributes(
-        &self,
-        server_state: &mut super::RealServerState,
-        window: x::Window,
-        attrs: WindowAttributes,
-    ) {
-        if let Some(name) = attrs.title {
+        if let Some(name) = title {
             server_state.set_win_title(window, name);
         }
-        if let Some(class) = attrs.class {
+        if let Some(class) = class.resolve()? {
             server_state.set_win_class(window, class);
         }
-        if let Some(hints) = attrs.size_hints {
+        if let Some(hints) = size_hints.resolve()? {
             server_state.set_size_hints(window, hints);
         }
+
+        let motif_hints = motif_wm_hints.resolve()?;
+        if let Some(decorations) = motif_hints.as_ref().and_then(|m| m.decorations) {
+            server_state.set_win_decorations(window, decorations);
+        }
+
+        let transient_for = self
+            .property_cookie_wrapper(
+                window,
+                self.atoms.wm_transient_for,
+                x::ATOM_WINDOW,
+                1,
+                |reply: x::GetPropertyReply| reply.value::<x::Window>().first().copied(),
+            )
+            .resolve()?
+            .flatten();
+
+        let is_popup = self.guess_is_popup(window, motif_hints, transient_for.is_some())?;
+        server_state.set_popup(window, is_popup);
+        if let Some(parent) = transient_for.and_then(|t| (!is_popup).then_some(t)) {
+            server_state.set_transient_for(window, parent);
+        }
+
+        Ok(())
+    }
+
+    fn property_cookie_wrapper<F: PropertyResolver>(
+        &self,
+        window: x::Window,
+        property: x::Atom,
+        ty: x::Atom,
+        len: u32,
+        resolver: F,
+    ) -> PropertyCookieWrapper<F> {
+        PropertyCookieWrapper {
+            connection: &self.connection,
+            cookie: self.get_property_cookie(window, property, ty, len),
+            resolver,
+        }
+    }
+
+    fn guess_is_popup(
+        &self,
+        window: x::Window,
+        motif_hints: Option<motif::Hints>,
+        has_transient_for: bool,
+    ) -> XResult<bool> {
+        if let Some(hints) = motif_hints {
+            // If the motif hints indicate the user shouldn't be able to do anything
+            // to the window at all, it stands to reason it's probably a popup.
+            if hints.functions.is_some_and(|f| f.is_empty()) {
+                return Ok(true);
+            }
+        }
+
+        let attrs = self
+            .connection
+            .send_request(&x::GetWindowAttributes { window });
+
+        let atoms_vec = |reply: x::GetPropertyReply| reply.value::<x::Atom>().to_vec();
+        let window_types =
+            self.property_cookie_wrapper(window, self.window_atoms.ty, x::ATOM_ATOM, 10, atoms_vec);
+        let window_state = self.property_cookie_wrapper(
+            window,
+            self.atoms.net_wm_state,
+            x::ATOM_ATOM,
+            10,
+            atoms_vec,
+        );
+
+        let override_redirect = self.connection.wait_for_reply(attrs)?.override_redirect();
+        let mut is_popup = override_redirect;
+
+        let window_types = window_types.resolve()?.unwrap_or_else(|| {
+            if !override_redirect && has_transient_for {
+                vec![self.window_atoms.dialog]
+            } else {
+                vec![self.window_atoms.normal]
+            }
+        });
+
+        if log::log_enabled!(log::Level::Debug) {
+            let win_types = window_types
+                .iter()
+                .copied()
+                .map(|t| get_atom_name(&self.connection, t))
+                .collect::<Vec<_>>();
+
+            debug!("{window:?} window_types: {win_types:?}");
+        }
+        debug!("{window:?} override_redirect: {override_redirect:?}");
+
+        let mut known_window_type = false;
+        for ty in window_types {
+            match ty {
+                x if x == self.window_atoms.normal || x == self.window_atoms.dialog => {
+                    is_popup = override_redirect;
+                }
+                x if x == self.window_atoms.menu || x == self.window_atoms.tooltip => {
+                    is_popup = true;
+                }
+                _ => {
+                    continue;
+                }
+            }
+
+            known_window_type = true;
+            break;
+        }
+
+        if !known_window_type {
+            if let Some(states) = window_state.resolve()? {
+                is_popup = states.contains(&self.atoms.skip_taskbar);
+            }
+        }
+
+        Ok(is_popup)
     }
 
     fn get_property_cookie(
@@ -559,7 +684,7 @@ impl XState {
                 0
             };
             let mut data = data[class_start..].to_vec();
-            if data.last().copied().unwrap() != 0 {
+            if data.last().copied() != Some(0) {
                 data.push(0);
             }
             let class = CString::from_vec_with_nul(data).unwrap();
@@ -650,6 +775,46 @@ impl XState {
         }
     }
 
+    fn get_motif_wm_hints(
+        &self,
+        window: x::Window,
+    ) -> PropertyCookieWrapper<impl PropertyResolver<Output = motif::Hints>> {
+        let cookie = self.get_property_cookie(
+            window,
+            self.atoms.motif_wm_hints,
+            self.atoms.motif_wm_hints,
+            5,
+        );
+        let resolver = |reply: x::GetPropertyReply| {
+            let data: &[u32] = reply.value();
+            motif::Hints::from(data)
+        };
+
+        PropertyCookieWrapper {
+            connection: &self.connection,
+            cookie,
+            resolver,
+        }
+    }
+
+    fn get_pid(&self, window: x::Window) -> Option<u32> {
+        let Some(pid) = self
+            .connection
+            .wait_for_reply(self.connection.send_request(&xcb::res::QueryClientIds {
+                specs: &[xcb::res::ClientIdSpec {
+                    client: window.resource_id(),
+                    mask: xcb::res::ClientIdMask::LOCAL_CLIENT_PID,
+                }],
+            }))
+            .ok()
+            .and_then(|reply| Some(*reply.ids().next()?.value().first()?))
+        else {
+            warn!("Failed to get pid of window: {window:?}");
+            return None;
+        };
+        Some(pid)
+    }
+
     fn handle_property_change(
         &mut self,
         event: x::PropertyNotifyEvent,
@@ -690,6 +855,13 @@ impl XState {
                     unwrap_or_skip_bad_window!(self.get_wm_class(window).resolve()).unwrap();
                 server_state.set_win_class(window, class);
             }
+            x if x == self.atoms.motif_wm_hints => {
+                let motif_hints =
+                    unwrap_or_skip_bad_window!(self.get_motif_wm_hints(window).resolve()).unwrap();
+                if let Some(decorations) = motif_hints.decorations {
+                    server_state.set_win_decorations(window, decorations);
+                }
+            }
             _ => {
                 if !self.handle_selection_property_change(&event)
                     && log::log_enabled!(log::Level::Debug)
@@ -707,38 +879,45 @@ impl XState {
 
 xcb::atoms_struct! {
     #[derive(Clone, Debug)]
-    pub struct Atoms {
-        pub wl_surface_id => b"WL_SURFACE_ID" only_if_exists = false,
-        pub wl_surface_serial => b"WL_SURFACE_SERIAL" only_if_exists = false,
-        pub wm_protocols => b"WM_PROTOCOLS" only_if_exists = false,
-        pub wm_delete_window => b"WM_DELETE_WINDOW" only_if_exists = false,
-        pub wm_transient_for => b"WM_TRANSIENT_FOR" only_if_exists = false,
-        pub wm_check => b"_NET_SUPPORTING_WM_CHECK" only_if_exists = false,
-        pub net_wm_name => b"_NET_WM_NAME" only_if_exists = false,
-        pub wm_pid => b"_NET_WM_PID" only_if_exists = false,
-        pub net_wm_state => b"_NET_WM_STATE" only_if_exists = false,
-        pub wm_fullscreen => b"_NET_WM_STATE_FULLSCREEN" only_if_exists = false,
-        pub active_win => b"_NET_ACTIVE_WINDOW" only_if_exists = false,
-        pub client_list => b"_NET_CLIENT_LIST" only_if_exists = false,
-        pub supported => b"_NET_SUPPORTED" only_if_exists = false,
-        pub utf8_string => b"UTF8_STRING" only_if_exists = false,
-        pub clipboard => b"CLIPBOARD" only_if_exists = false,
-        pub targets => b"TARGETS" only_if_exists = false,
-        pub save_targets => b"SAVE_TARGETS" only_if_exists = false,
-        pub multiple => b"MULTIPLE" only_if_exists = false,
-        pub timestamp => b"TIMESTAMP" only_if_exists = false,
-        pub selection_reply => b"_selection_reply" only_if_exists = false,
-        pub incr => b"INCR" only_if_exists = false,
+    struct Atoms {
+        wl_surface_id => b"WL_SURFACE_ID" only_if_exists = false,
+        wl_surface_serial => b"WL_SURFACE_SERIAL" only_if_exists = false,
+        wm_protocols => b"WM_PROTOCOLS" only_if_exists = false,
+        wm_delete_window => b"WM_DELETE_WINDOW" only_if_exists = false,
+        wm_transient_for => b"WM_TRANSIENT_FOR" only_if_exists = false,
+        wm_state => b"WM_STATE" only_if_exists = false,
+        wm_check => b"_NET_SUPPORTING_WM_CHECK" only_if_exists = false,
+        net_wm_name => b"_NET_WM_NAME" only_if_exists = false,
+        wm_pid => b"_NET_WM_PID" only_if_exists = false,
+        net_wm_state => b"_NET_WM_STATE" only_if_exists = false,
+        wm_fullscreen => b"_NET_WM_STATE_FULLSCREEN" only_if_exists = false,
+        skip_taskbar => b"_NET_WM_STATE_SKIP_TASKBAR" only_if_exists = false,
+        active_win => b"_NET_ACTIVE_WINDOW" only_if_exists = false,
+        client_list => b"_NET_CLIENT_LIST" only_if_exists = false,
+        supported => b"_NET_SUPPORTED" only_if_exists = false,
+        motif_wm_hints => b"_MOTIF_WM_HINTS" only_if_exists = false,
+        utf8_string => b"UTF8_STRING" only_if_exists = false,
+        clipboard => b"CLIPBOARD" only_if_exists = false,
+        targets => b"TARGETS" only_if_exists = false,
+        save_targets => b"SAVE_TARGETS" only_if_exists = false,
+        multiple => b"MULTIPLE" only_if_exists = false,
+        timestamp => b"TIMESTAMP" only_if_exists = false,
+        selection_reply => b"_selection_reply" only_if_exists = false,
+        incr => b"INCR" only_if_exists = false,
+        xsettings => b"_XSETTINGS_S0" only_if_exists = false,
+        xsettings_settings => b"_XSETTINGS_SETTINGS" only_if_exists = false,
     }
 }
 
 xcb::atoms_struct! {
-    pub struct WindowTypes {
-        pub normal => b"_NET_WM_WINDOW_TYPE_NORMAL" only_if_exists = false,
-        pub dialog => b"_NET_WM_WINDOW_TYPE_DIALOG" only_if_exists = false,
-        pub splash => b"_NET_WM_WINDOW_TYPE_SPLASH" only_if_exists = false,
-        pub menu => b"_NET_WM_WINDOW_TYPE_MENU" only_if_exists = false,
-        pub utility => b"_NET_WM_WINDOW_TYPE_UTILITY" only_if_exists = false,
+    struct WindowTypes {
+        ty => b"_NET_WM_WINDOW_TYPE" only_if_exists = false,
+        normal => b"_NET_WM_WINDOW_TYPE_NORMAL" only_if_exists = false,
+        dialog => b"_NET_WM_WINDOW_TYPE_DIALOG" only_if_exists = false,
+        splash => b"_NET_WM_WINDOW_TYPE_SPLASH" only_if_exists = false,
+        menu => b"_NET_WM_WINDOW_TYPE_MENU" only_if_exists = false,
+        utility => b"_NET_WM_WINDOW_TYPE_UTILITY" only_if_exists = false,
+        tooltip => b"_NET_WM_WINDOW_TYPE_TOOLTIP" only_if_exists = false,
     }
 }
 
@@ -766,13 +945,13 @@ bitflags! {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct WinSize {
     pub width: i32,
     pub height: i32,
 }
 
-#[derive(Default, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
 pub struct WmNormalHints {
     pub min_size: Option<WinSize>,
     pub max_size: Option<WinSize>,
@@ -820,6 +999,83 @@ impl From<&[u32]> for WmHints {
     }
 }
 
+pub use motif::Decorations;
+mod motif {
+    use super::*;
+    // Motif WM hints are incredibly poorly documented, I could only find this header:
+    // https://www.opengroup.org/infosrv/openmotif/R2.1.30/motif/lib/Xm/MwmUtil.h
+    // and these random Perl docs:
+    // https://metacpan.org/pod/X11::Protocol::WM#_MOTIF_WM_HINTS
+
+    bitflags! {
+        struct HintsFlags: u32 {
+            const Functions = 1;
+            const Decorations = 2;
+        }
+    }
+
+    bitflags! {
+        pub(super) struct Functions: u32 {
+            const All = 1;
+            const Resize = 2;
+            const Move = 4;
+            const Minimize = 8;
+            const Maximize = 16;
+            const Close = 32;
+        }
+    }
+
+    #[derive(Default)]
+    pub(super) struct Hints {
+        pub(super) functions: Option<Functions>,
+        pub(super) decorations: Option<Decorations>,
+    }
+
+    impl From<&[u32]> for Hints {
+        fn from(value: &[u32]) -> Self {
+            let mut ret = Self::default();
+
+            let flags = HintsFlags::from_bits_truncate(value[0]);
+
+            if flags.contains(HintsFlags::Functions) {
+                ret.functions = Some(Functions::from_bits_truncate(value[1]));
+            }
+            if flags.contains(HintsFlags::Decorations) {
+                ret.decorations = value[2].try_into().ok();
+            }
+
+            ret
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+    pub enum Decorations {
+        Client = 0,
+        Server = 1,
+    }
+
+    impl TryFrom<u32> for Decorations {
+        type Error = ();
+
+        fn try_from(value: u32) -> Result<Self, ()> {
+            match value {
+                0 => Ok(Self::Client),
+                1 => Ok(Self::Server),
+                _ => Err(()),
+            }
+        }
+    }
+
+    impl From<Decorations> for zxdg_toplevel_decoration_v1::Mode {
+        fn from(value: Decorations) -> Self {
+            match value {
+                Decorations::Client => zxdg_toplevel_decoration_v1::Mode::ClientSide,
+                Decorations::Server => zxdg_toplevel_decoration_v1::Mode::ServerSide,
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum SetState {
     Remove,
@@ -839,15 +1095,36 @@ impl TryFrom<u32> for SetState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WmState {
+    Withdrawn = 0,
+    Normal = 1,
+    Iconic = 3,
+}
+
+impl TryFrom<u32> for WmState {
+    type Error = ();
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Withdrawn),
+            1 => Ok(Self::Normal),
+            3 => Ok(Self::Iconic),
+            _ => Err(()),
+        }
+    }
+}
+
 pub struct RealConnection {
+    atoms: Atoms,
     connection: Rc<xcb::Connection>,
     outputs: HashMap<String, xcb::randr::Output>,
     primary_output: xcb::randr::Output,
 }
 
 impl RealConnection {
-    fn new(connection: Rc<xcb::Connection>) -> Self {
+    fn new(connection: Rc<xcb::Connection>, atoms: Atoms) -> Self {
         Self {
+            atoms,
             connection,
             outputs: Default::default(),
             primary_output: Xid::none(),
@@ -896,7 +1173,6 @@ impl RealConnection {
 }
 
 impl XConnection for RealConnection {
-    type ExtraData = Atoms;
     type X11Selection = Selection;
 
     fn root_window(&self) -> x::Window {
@@ -916,9 +1192,9 @@ impl XConnection for RealConnection {
         }));
     }
 
-    fn set_fullscreen(&mut self, window: x::Window, fullscreen: bool, atoms: Self::ExtraData) {
+    fn set_fullscreen(&mut self, window: x::Window, fullscreen: bool) {
         let data = if fullscreen {
-            std::slice::from_ref(&atoms.wm_fullscreen)
+            std::slice::from_ref(&self.atoms.wm_fullscreen)
         } else {
             &[]
         };
@@ -928,7 +1204,7 @@ impl XConnection for RealConnection {
             .send_and_check_request(&x::ChangeProperty::<x::Atom> {
                 mode: x::PropMode::Replace,
                 window,
-                property: atoms.net_wm_state,
+                property: self.atoms.net_wm_state,
                 r#type: x::ATOM_ATOM,
                 data,
             })
@@ -937,12 +1213,7 @@ impl XConnection for RealConnection {
         }
     }
 
-    fn focus_window(
-        &mut self,
-        window: x::Window,
-        output_name: Option<String>,
-        atoms: Self::ExtraData,
-    ) {
+    fn focus_window(&mut self, window: x::Window, output_name: Option<String>) {
         trace!("{window:?} {output_name:?}");
         if let Err(e) = self.connection.send_and_check_request(&x::SetInputFocus {
             focus: window,
@@ -955,9 +1226,18 @@ impl XConnection for RealConnection {
         if let Err(e) = self.connection.send_and_check_request(&x::ChangeProperty {
             mode: x::PropMode::Replace,
             window: self.root_window(),
-            property: atoms.active_win,
+            property: self.atoms.active_win,
             r#type: x::ATOM_WINDOW,
             data: &[window],
+        }) {
+            debug!("ChangeProperty failed ({:?}: {:?})", window, e);
+        }
+        if let Err(e) = self.connection.send_and_check_request(&x::ChangeProperty {
+            mode: x::PropMode::Replace,
+            window,
+            property: self.atoms.wm_state,
+            r#type: self.atoms.wm_state,
+            data: &[WmState::Normal as u32, 0],
         }) {
             debug!("ChangeProperty failed ({:?}: {:?})", window, e);
         }
@@ -992,22 +1272,25 @@ impl XConnection for RealConnection {
         }
     }
 
-    fn close_window(&mut self, window: x::Window, atoms: Self::ExtraData) {
+    fn close_window(&mut self, window: x::Window) {
         let cookie = self.connection.send_request(&x::GetProperty {
             window,
             delete: false,
-            property: atoms.wm_protocols,
+            property: self.atoms.wm_protocols,
             r#type: x::ATOM_ATOM,
             long_offset: 0,
             long_length: 10,
         });
         let reply = unwrap_or_skip_bad_window!(self.connection.wait_for_reply(cookie));
 
-        if reply.value::<x::Atom>().contains(&atoms.wm_delete_window) {
-            let data = [atoms.wm_delete_window.resource_id(), 0, 0, 0, 0];
+        if reply
+            .value::<x::Atom>()
+            .contains(&self.atoms.wm_delete_window)
+        {
+            let data = [self.atoms.wm_delete_window.resource_id(), 0, 0, 0, 0];
             let event = &x::ClientMessageEvent::new(
                 window,
-                atoms.wm_protocols,
+                self.atoms.wm_protocols,
                 x::ClientMessageData::Data32(data),
             );
 
@@ -1024,17 +1307,17 @@ impl XConnection for RealConnection {
         }
     }
 
+    fn unmap_window(&mut self, window: x::Window) {
+        unwrap_or_skip_bad_window!(self
+            .connection
+            .send_and_check_request(&x::UnmapWindow { window }));
+    }
+
     fn raise_to_top(&mut self, window: x::Window) {
         unwrap_or_skip_bad_window!(self.connection.send_and_check_request(&x::ConfigureWindow {
             window,
             value_list: &[x::ConfigWindow::StackMode(x::StackMode::Above)],
         }));
-    }
-}
-
-impl super::FromServerState<RealConnection> for Atoms {
-    fn create(state: &super::RealServerState) -> Self {
-        state.atoms.as_ref().unwrap().clone()
     }
 }
 
