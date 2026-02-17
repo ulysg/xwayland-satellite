@@ -32,7 +32,7 @@ cargo vendor
 %{cargo_license} > LICENSE.dependencies
 
 %install
-%cargo_install
+%cargo_install -f systemd
 mkdir -p %{buildroot}/usr/lib/systemd/user/
 cp -a resources/xwayland-satellite.service %{buildroot}/usr/lib/systemd/user/
 sed -i "s:/usr/local/bin:%{_bindir}:" %{buildroot}/usr/lib/systemd/user/xwayland-satellite.service
